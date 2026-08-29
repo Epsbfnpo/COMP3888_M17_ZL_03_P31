@@ -1,0 +1,30 @@
+# Python cache/build output
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Generated outputs and local inspection data
+outputs/
+_inspection_group_work*/
+_remote_check*/
+
+# Local/private imaging data
+data/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
