@@ -238,7 +238,7 @@ synthetic demonstration is included. It generates two small patients, each with
 BL/FU CT, PET and masks, then exercises both stories end-to-end:
 
 ```powershell
-python tools/demo_loading_and_lesions.py
+python tests/demo_loading_and_lesions.py
 ```
 
 Expected summary:
