@@ -32,7 +32,9 @@ python -m pip install -r requirements.txt
 ## Generate the manifest
 
 Place or mount the Cohort A subset at a known local path, for example
-`data/cohort_a/`. The data folder is local/private and is ignored by Git.
+`data/cohort_a/`. The script supports Cohort A folders with `inputsTr/` plus
+either `targetsTr/` or `outputsTr/` masks. The data folder is local/private and
+is ignored by Git.
 
 ```powershell
 python tools/prepare_cohort_a_subset.py `

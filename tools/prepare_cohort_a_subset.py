@@ -100,11 +100,14 @@ def candidate_pet_paths(root: Path, patient_id: str, timepoint: str, image_id: s
 def candidate_mask_paths(root: Path, patient_id: str, timepoint: str, image_id: str) -> list[Path]:
     inputs = root / "inputsTr"
     targets = root / "targetsTr"
+    outputs = root / "outputsTr"
     return [
         inputs / f"{patient_id}_{timepoint}_mask_{image_id}.nii.gz",
         targets / f"{patient_id}_{timepoint}_mask_{image_id}.nii.gz",
+        outputs / f"{patient_id}_{timepoint}_mask_{image_id}.nii.gz",
         inputs / f"{patient_id}_{timepoint}_label_{image_id}.nii.gz",
         targets / f"{patient_id}_{timepoint}_label_{image_id}.nii.gz",
+        outputs / f"{patient_id}_{timepoint}_label_{image_id}.nii.gz",
     ]
 
 

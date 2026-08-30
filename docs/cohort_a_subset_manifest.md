@@ -1,7 +1,8 @@
 # Cohort A subset manifest
 
 This module prepares a small, reproducible subset of Cohort A patients for pipeline
-development. It scans a Cohort A-style folder with `inputsTr/` and `targetsTr/`,
+development. It scans a Cohort A-style folder with `inputsTr/` plus either
+`targetsTr/` or `outputsTr/`,
 selects a small number of patients, and writes CSV manifests that can be loaded
 directly with pandas.
 
@@ -54,7 +55,7 @@ Columns:
 - `scan_id`: stable scan identifier used by downstream code.
 - `ct_path`: CT image path, from `*_img_<id>.nii.gz`.
 - `pet_path`: PET/SUV path if available.
-- `lesion_mask_path`: lesion mask path, from `inputsTr/` or `targetsTr/`.
+- `lesion_mask_path`: lesion mask path, from `inputsTr/`, `targetsTr/`, or `outputsTr/`.
 - `reference_csv_path`: expert correspondence CSV for the patient.
 - `reference_json_path`: point-reference JSON for the scan if available.
 - `missing_files`: semicolon-separated missing fields.
