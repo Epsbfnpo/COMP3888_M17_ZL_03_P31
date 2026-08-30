@@ -1,82 +1,4 @@
-# COMP3888_M17_ZL_03_P31
-
-P31 longitudinal PET/CT lesion quantification project.
-
-## Cohort A subset manifest
-
-This repository includes tooling to prepare a small Cohort A patient subset for
-pipeline development without requiring the full dataset. The manifest records
-baseline and follow-up scans separately, including CT, PET, lesion-mask, and
-available expert-reference paths, while explicitly flagging missing files.
-
-## Environment setup
-
-On Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-On macOS/Linux:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-## Generate the manifest
-
-Place or mount the Cohort A subset anywhere on your local machine. The script
-supports Cohort A folders with `inputsTr/` plus either `targetsTr/` or
-`outputsTr/` masks. The data folder is local/private and is ignored by Git.
-
-Pass the dataset path at runtime:
-
-```powershell
-python tools/prepare_cohort_a_subset.py `
-  --root "D:\path\to\cohort_a" `
-  --out-dir outputs/cohort_a_subset `
-  --max-patients 5
-```
-
-Alternatively, set `COHORT_A_ROOT` once per environment:
-
-```powershell
-$env:COHORT_A_ROOT = "D:\path\to\cohort_a"
-python tools/prepare_cohort_a_subset.py `
-  --out-dir outputs/cohort_a_subset `
-  --max-patients 5
-```
-
-By default, CSV paths are written relative to `--root`, so the manifest stays
-portable across cloned environments that keep the same dataset layout.
-
-To create a copied portable subset beside the manifest:
-
-```powershell
-python tools/prepare_cohort_a_subset.py `
-  --root "D:\path\to\cohort_a" `
-  --out-dir outputs/cohort_a_subset `
-  --max-patients 5 `
-  --copy-files `
-  --path-mode relative-to-manifest
-```
-
-## Load the manifest
-
-```python
-import pandas as pd
-
-scan_manifest = pd.read_csv("outputs/cohort_a_subset/cohort_a_subset_manifest.csv")
-pair_manifest = pd.read_csv("outputs/cohort_a_subset/cohort_a_subset_pairs.csv")
-```
-
-## Cohort A PET/CT loading and lesion extraction
+# Cohort A PET/CT loading and lesion extraction
 
 This implementation covers load baseline and follow-up PET/CT volumes and load lesion masks and extract individual lesions
  
@@ -92,7 +14,7 @@ These modules determine how to load and process these files.
 - `src/lesion_components.py` — mask validation and 3-D connected-component extraction.
 - `tools/inspect_cohort_a_patient.py` — CLI to inspect BL/FU CT/PET metadata.
 - `tools/extract_cohort_a_lesions.py` — CLI to report and export BL/FU lesions.
-- `test/demo_loading_and_lesions.py` — self-contained two-patient demonstration.
+- `tests/demo_loading_and_lesions.py` — self-contained two-patient demonstration.
 - `tests/test_loading_and_lesions.py` — acceptance-oriented automated tests.
 
 ## 1. Load baseline and follow-up PET/CT volumes
@@ -238,7 +160,7 @@ synthetic demonstration is included. It generates two small patients, each with
 BL/FU CT, PET and masks, then exercises both stories end-to-end:
 
 ```powershell
-python tools/demo_loading_and_lesions.py
+python tests/demo_loading_and_lesions.py
 ```
 
 Expected summary:
