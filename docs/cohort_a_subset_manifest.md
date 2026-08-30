@@ -10,17 +10,26 @@ directly with pandas.
 
 ```powershell
 python tools/prepare_cohort_a_subset.py `
-  --root data/cohort_a `
+  --root "D:\path\to\cohort_a" `
   --out-dir outputs/cohort_a_subset `
   --max-patients 5 `
   --path-mode relative-to-root
+```
+
+If the dataset location differs between machines, set it per environment:
+
+```powershell
+$env:COHORT_A_ROOT = "D:\path\to\cohort_a"
+python tools/prepare_cohort_a_subset.py `
+  --out-dir outputs/cohort_a_subset `
+  --max-patients 5
 ```
 
 To select exact patients:
 
 ```powershell
 python tools/prepare_cohort_a_subset.py `
-  --root data/cohort_a `
+  --root "D:\path\to\cohort_a" `
   --out-dir outputs/cohort_a_subset `
   --patient-ids 0a09c8844b,0aa1883c64
 ```
@@ -29,7 +38,7 @@ To copy the selected files into a portable subset folder:
 
 ```powershell
 python tools/prepare_cohort_a_subset.py `
-  --root data/cohort_a `
+  --root "D:\path\to\cohort_a" `
   --out-dir outputs/cohort_a_subset `
   --max-patients 5 `
   --copy-files `

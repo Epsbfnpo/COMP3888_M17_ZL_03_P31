@@ -318,7 +318,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Prepare a small Cohort A subset manifest with BL/FU imaging, mask, and reference paths."
     )
-    parser.add_argument("--root", required=True, help="Cohort A root containing inputsTr/ and targetsTr/.")
+    parser.add_argument(
+        "--root",
+        default="",
+        help=(
+            "Cohort A root containing inputsTr/ plus targetsTr/ or outputsTr/. "
+            "If omitted, COHORT_A_ROOT is used."
+        ),
+    )
     parser.add_argument("--out-dir", default="outputs/cohort_a_subset", help="Directory for manifest outputs.")
     parser.add_argument("--max-patients", type=int, default=5, help="Select the first N patients after sorting.")
     parser.add_argument("--patient-ids", default="", help="Optional comma-separated patient IDs. Overrides --max-patients.")
@@ -340,7 +347,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    root = Path(args.root).resolve()
+    root_text = args.root.strip() or os.environ.get("COHORT_A_ROOT", "").strip()
+    if not root_text:
+        raise SystemExit("No Cohort A root provided. Use --root or set COHORT_A_ROOT.")
+    root = Path(root_text).expanduser().resolve()
     out_dir = Path(args.out_dir).resolve()
     discovered = discover_patient_ids(root)
     if args.patient_ids.strip():

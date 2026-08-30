@@ -31,14 +31,24 @@ python -m pip install -r requirements.txt
 
 ## Generate the manifest
 
-Place or mount the Cohort A subset at a known local path, for example
-`data/cohort_a/`. The script supports Cohort A folders with `inputsTr/` plus
-either `targetsTr/` or `outputsTr/` masks. The data folder is local/private and
-is ignored by Git.
+Place or mount the Cohort A subset anywhere on your local machine. The script
+supports Cohort A folders with `inputsTr/` plus either `targetsTr/` or
+`outputsTr/` masks. The data folder is local/private and is ignored by Git.
+
+Pass the dataset path at runtime:
 
 ```powershell
 python tools/prepare_cohort_a_subset.py `
-  --root data/cohort_a `
+  --root "D:\path\to\cohort_a" `
+  --out-dir outputs/cohort_a_subset `
+  --max-patients 5
+```
+
+Alternatively, set `COHORT_A_ROOT` once per environment:
+
+```powershell
+$env:COHORT_A_ROOT = "D:\path\to\cohort_a"
+python tools/prepare_cohort_a_subset.py `
   --out-dir outputs/cohort_a_subset `
   --max-patients 5
 ```
@@ -50,7 +60,7 @@ To create a copied portable subset beside the manifest:
 
 ```powershell
 python tools/prepare_cohort_a_subset.py `
-  --root data/cohort_a `
+  --root "D:\path\to\cohort_a" `
   --out-dir outputs/cohort_a_subset `
   --max-patients 5 `
   --copy-files `

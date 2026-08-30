@@ -23,6 +23,9 @@ _remote_check*/
 # Local/private imaging data
 data/
 
+# Local machine-specific configuration
+.env
+
 # OS/editor files
 .DS_Store
 Thumbs.db
