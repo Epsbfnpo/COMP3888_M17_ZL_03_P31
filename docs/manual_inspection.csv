@@ -1,0 +1,4 @@
+patient_id,modality,baseline_slice,followup_slice,baseline_lesion_voxels,followup_lesion_voxels,image_mask_alignment,manual_review,notes,figure
+0a09c8844b,CT,109,115,36697,57673,PASS,PASS,BL/FU CT visible; masks align with anatomy; selected slices contain lesions,0a09c8844b_ct_overlay.png
+0e01938fc4,CT,170,208,1089,224,PASS,PASS,BL/FU CT visible; small masks remain clearly visible and aligned,0e01938fc4_ct_overlay.png
+0e51011a4c,CT,126,87,61760,13228,PASS,PASS,BL/FU CT visible; liver lesion masks align in both timepoints,0e51011a4c_ct_overlay.png
