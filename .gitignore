@@ -28,3 +28,9 @@ data/
 Thumbs.db
 .idea/
 .vscode/
+
+# R history and generated HTML files
+/.Rhistory
+/*.html
+/docs/**/.Rhistory
+/docs/**/*.html
