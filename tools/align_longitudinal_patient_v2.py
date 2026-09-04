@@ -8,7 +8,7 @@ import numpy as np
 import streamlit as st
 
 # Allow:
-#   streamlit run tools/align_cohort_a_patient.py
+#   streamlit run tools/align_longitudinal_patient_v2.py
 # from the repository root without installing src as a package.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -25,6 +25,7 @@ from src.registration import RegistrationError, register_patient_ct  # noqa: E40
 
 DEFAULT_PAIRS = "outputs/cohort_a_subset/cohort_a_subset_pairs.csv"
 DEFAULT_OUTPUT_ROOT = "outputs/registration"
+APP_VERSION = "V2 · Fast 3-panel viewer"
 
 
 @st.cache_data(show_spinner=False)
@@ -88,7 +89,6 @@ def _registration_is_ready(output_dir: Path, registered_path: Path) -> bool:
     return (
         registered_path.exists()
         and (output_dir / "TransformParameters.0.txt").exists()
-        and (output_dir / "TransformParameters.1.txt").exists()
     )
 
 
@@ -149,30 +149,35 @@ def _prepare_display_volume(
     return np.rint(image).astype(np.uint8)
 
 
+def _file_modified_ns(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
 def _display_cache_signature(
     patient_id: str,
     registered_path: Path,
     registered_modified_ns: int,
+    bl_ct: LoadedVolume,
     fu_ct: LoadedVolume,
     window_name: str,
 ) -> tuple[object, ...]:
     """
-    Build a small signature for the single in-session display-volume cache.
+    Build a signature for the single in-session display-volume cache.
 
-    Only one patient/window pair is retained at a time to avoid accumulating
-    several hundred MB if the user switches among patients or CT windows.
+    Only the current patient/window is retained, so switching among several
+    patients does not accumulate multiple full CT display volumes in memory.
     """
-    try:
-        fu_modified_ns = fu_ct.metadata.path.stat().st_mtime_ns
-    except OSError:
-        fu_modified_ns = None
-
     return (
         str(patient_id),
         str(registered_path.resolve()),
         int(registered_modified_ns),
+        str(bl_ct.metadata.path),
+        _file_modified_ns(bl_ct.metadata.path),
         str(fu_ct.metadata.path),
-        fu_modified_ns,
+        _file_modified_ns(fu_ct.metadata.path),
         str(window_name),
     )
 
@@ -182,16 +187,16 @@ def _get_display_volumes(
     patient_id: str,
     registered_path: Path,
     registered_modified_ns: int,
+    bl_ct: LoadedVolume,
     registered_bl: LoadedVolume,
     fu_ct: LoadedVolume,
     window_name: str,
-) -> tuple[np.ndarray, np.ndarray, float, float]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
     """
-    Return windowed uint8 BL/FU volumes.
+    Return windowed uint8 Original-BL / Registered-BL / FU volumes.
 
-    The current pair is stored in st.session_state so normal full-app reruns do
-    not rebuild it unless patient, registered result, FU source, or CT window
-    changes.
+    These are prepared once per patient/window and kept in session state.
+    Slider movement therefore only extracts three already-windowed slices.
     """
     low_hu, high_hu = _window_values(window_name)
 
@@ -199,13 +204,19 @@ def _get_display_volumes(
         patient_id,
         registered_path,
         registered_modified_ns,
+        bl_ct,
         fu_ct,
         window_name,
     )
 
     cache = st.session_state.get("_alignment_display_cache")
     if cache is None or cache.get("signature") != signature:
-        with st.spinner(f"Preparing {window_name.lower()} display volume..."):
+        with st.spinner(f"Preparing {window_name.lower()} display volumes..."):
+            original_display = _prepare_display_volume(
+                bl_ct.data,
+                low_hu=low_hu,
+                high_hu=high_hu,
+            )
             registered_display = _prepare_display_volume(
                 registered_bl.data,
                 low_hu=low_hu,
@@ -217,9 +228,9 @@ def _get_display_volumes(
                 high_hu=high_hu,
             )
 
-        # Keep only the currently used display pair.
         st.session_state["_alignment_display_cache"] = {
             "signature": signature,
+            "original": original_display,
             "registered": registered_display,
             "followup": fu_display,
             "low_hu": low_hu,
@@ -228,12 +239,12 @@ def _get_display_volumes(
         cache = st.session_state["_alignment_display_cache"]
 
     return (
+        cache["original"],
         cache["registered"],
         cache["followup"],
         float(cache["low_hu"]),
         float(cache["high_hu"]),
     )
-
 
 def _axial_uint8_slice(volume: np.ndarray, index: int) -> np.ndarray:
     """
@@ -267,27 +278,99 @@ def _slice_world_position_mm(volume: LoadedVolume, index: int) -> np.ndarray:
     return world[:3]
 
 
+def _closest_native_bl_slice(
+    bl_ct: LoadedVolume,
+    target_world_xyz: np.ndarray,
+) -> tuple[int, float, bool]:
+    """
+    Find the original BL axial slice plane closest to a FU-space world point.
+
+    This is only an approximate 'before registration' comparison. Registered BL
+    and FU share exact geometry, while Original BL remains in its native frame.
+
+    Returns
+    -------
+    index:
+        Nearest valid native BL slice index.
+    continuous_index:
+        Unrounded slice coordinate before clamping.
+    outside_fov:
+        True when the target lies beyond the native BL slice range.
+    """
+    affine = np.asarray(bl_ct.metadata.affine, dtype=float)
+    shape = bl_ct.data.shape
+
+    centre_voxel_0 = np.asarray(
+        [
+            (shape[0] - 1) / 2.0,
+            (shape[1] - 1) / 2.0,
+            0.0,
+            1.0,
+        ],
+        dtype=float,
+    )
+    centre_world_0 = (affine @ centre_voxel_0)[:3]
+
+    row_axis = affine[:3, 0]
+    col_axis = affine[:3, 1]
+    slice_step = affine[:3, 2]
+
+    normal = np.cross(row_axis, col_axis)
+    normal_norm = float(np.linalg.norm(normal))
+
+    target = np.asarray(target_world_xyz, dtype=float)
+
+    if normal_norm > 1e-8:
+        normal /= normal_norm
+        denominator = float(np.dot(slice_step, normal))
+    else:
+        denominator = 0.0
+
+    if abs(denominator) > 1e-8:
+        continuous_index = float(
+            np.dot(target - centre_world_0, normal) / denominator
+        )
+    else:
+        # Fallback for an unusual/sheared affine: project onto the slice-step
+        # centre line instead of the slice-plane normal.
+        step_norm_sq = float(np.dot(slice_step, slice_step))
+        if step_norm_sq <= 1e-12:
+            continuous_index = 0.0
+        else:
+            continuous_index = float(
+                np.dot(target - centre_world_0, slice_step) / step_norm_sq
+            )
+
+    last_index = shape[2] - 1
+    outside_fov = continuous_index < -0.5 or continuous_index > last_index + 0.5
+
+    index = int(np.clip(np.rint(continuous_index), 0, last_index))
+    return index, continuous_index, outside_fov
+
+
 @st.fragment
 def _render_slice_viewer(
+    original_display: np.ndarray,
     registered_display: np.ndarray,
     fu_display: np.ndarray,
+    bl_ct: LoadedVolume,
     fu_ct: LoadedVolume,
     patient_id: str,
     low_hu: float,
     high_hu: float,
 ) -> None:
     """
-    Interactive viewer fragment.
+    Three-column Before / After / Reference viewer.
 
-    Streamlit reruns only this function when the slider changes, rather than
-    rerunning manifest loading, patient loading, registration checks, and the
-    rest of the dashboard.
+    Registered BL and FU use the same exact FU slice index. Original BL remains
+    in its native geometry, so its displayed slice is selected by the closest
+    native axial plane to the current FU world position.
     """
     st.divider()
-    st.subheader("Aligned axial slice browser")
+    st.subheader("Alignment comparison")
     st.caption(
-        "Registered BL and FU are in the same FU geometry. "
-        "Moving the slider reruns only this viewer fragment."
+        "Original BL = before registration (approximate nearest native slice). "
+        "Registered BL and FU = exact same FU-space slice."
     )
 
     slice_count = fu_display.shape[2]
@@ -299,61 +382,95 @@ def _render_slice_viewer(
         st.session_state[state_key] = slice_count // 2
 
     slice_index = st.slider(
-        "Axial slice",
+        "FU-space axial slice",
         min_value=0,
         max_value=slice_count - 1,
         step=1,
         key=state_key,
     )
 
+    world_xyz = _slice_world_position_mm(fu_ct, slice_index)
+    original_index, original_float_index, outside_fov = (
+        _closest_native_bl_slice(bl_ct, world_xyz)
+    )
+
     try:
-        bl_slice = _axial_uint8_slice(registered_display, slice_index)
-        fu_slice = _axial_uint8_slice(fu_display, slice_index)
+        original_slice = _axial_uint8_slice(
+            original_display,
+            original_index,
+        )
+        registered_slice = _axial_uint8_slice(
+            registered_display,
+            slice_index,
+        )
+        fu_slice = _axial_uint8_slice(
+            fu_display,
+            slice_index,
+        )
     except Exception as exc:
-        st.error(f"Could not render slice {slice_index}: {exc}")
+        st.error(f"Could not render current slices: {exc}")
         return
 
-    world_xyz = _slice_world_position_mm(fu_ct, slice_index)
     st.caption(
-        f"Slice {slice_index + 1}/{slice_count} · "
-        f"centre world coordinate ≈ "
+        f"FU-space slice {slice_index + 1}/{slice_count} · "
+        f"world centre ≈ "
         f"({world_xyz[0]:.1f}, {world_xyz[1]:.1f}, {world_xyz[2]:.1f}) mm · "
         f"window [{low_hu:.0f}, {high_hu:.0f}] HU"
     )
 
-    left, right = st.columns(2)
+    if outside_fov:
+        st.warning(
+            "This FU-space position falls outside the native BL slice range. "
+            f"The Original BL panel is showing the nearest edge slice "
+            f"({original_index})."
+        )
 
-    with left:
-        st.markdown("**Registered BL CT**")
+    before, after, reference = st.columns(3)
+
+    with before:
+        st.markdown("**Original BL CT**")
         st.image(
-            bl_slice,
-            caption=f"BL → FU space · slice {slice_index}",
+            original_slice,
+            caption=(
+                f"Before alignment · native slice {original_index} "
+                f"(estimated {original_float_index:.1f})"
+            ),
             use_container_width=True,
         )
 
-    with right:
+    with after:
+        st.markdown("**Registered BL CT**")
+        st.image(
+            registered_slice,
+            caption=f"After alignment · FU-space slice {slice_index}",
+            use_container_width=True,
+        )
+
+    with reference:
         st.markdown("**FU CT**")
         st.image(
             fu_slice,
-            caption=f"FU reference · slice {slice_index}",
+            caption=f"Reference · FU-space slice {slice_index}",
             use_container_width=True,
         )
 
 
 def main() -> None:
     st.set_page_config(
-        page_title="Cohort A CT Alignment",
+        page_title="Longitudinal CT Alignment",
         page_icon="🩻",
         layout="wide",
     )
 
-    st.title("Cohort A BL → FU CT Alignment")
+    st.title("Longitudinal BL → FU CT Alignment")
+    st.caption(f"**{APP_VERSION}**")
     st.caption(
         "ITKElastix rigid + affine registration. "
-        "The slice viewer compares registered BL CT with FU CT in the same space."
+        "The viewer shows Original BL, Registered BL, and FU CT side by side."
     )
 
     with st.sidebar:
+        st.caption(APP_VERSION)
         st.header("Data")
 
         manifest_text = st.text_input(
@@ -362,11 +479,11 @@ def main() -> None:
             help="Usually outputs/cohort_a_subset/cohort_a_subset_pairs.csv",
         )
         data_root_text = st.text_input(
-            "Cohort A data root",
-            value=os.environ.get("COHORT_A_ROOT", ""),
+            "Data root",
+            value=(os.environ.get("DATA_ROOT") or os.environ.get("COHORT_B_ROOT") or os.environ.get("COHORT_A_ROOT", "")),
             help=(
-                "Leave blank if manifest paths are self-contained or "
-                "COHORT_A_ROOT is already set."
+                "Leave blank if manifest paths are self-contained or a data-root "
+                "environment variable is already set."
             ),
         )
         output_root_text = st.text_input(
@@ -400,7 +517,7 @@ def main() -> None:
         )
 
         st.header("Alignment")
-        st.write("Stable baseline: **Rigid → Affine**")
+        st.write("Conservative baseline: **Rigid only**")
         run_alignment = st.button(
             "Run / re-run alignment",
             type="primary",
@@ -497,10 +614,17 @@ def main() -> None:
         st.stop()
 
     try:
-        registered_display, fu_display, low_hu, high_hu = _get_display_volumes(
+        (
+            original_display,
+            registered_display,
+            fu_display,
+            low_hu,
+            high_hu,
+        ) = _get_display_volumes(
             patient_id=patient_id,
             registered_path=registered_path,
             registered_modified_ns=registered_modified_ns,
+            bl_ct=bl_ct,
             registered_bl=registered_bl,
             fu_ct=fu_ct,
             window_name=window_name,
@@ -510,8 +634,10 @@ def main() -> None:
         st.stop()
 
     _render_slice_viewer(
+        original_display,
         registered_display,
         fu_display,
+        bl_ct,
         fu_ct,
         patient_id,
         low_hu,

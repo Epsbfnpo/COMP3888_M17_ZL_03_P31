@@ -336,7 +336,7 @@ def register_patient_ct(
     pair: PatientPairVolumes,
     *,
     output_dir: str | Path,
-    stages: Iterable[str] = ("rigid", "affine"),
+    stages: Iterable[str] = ("rigid",),
     number_of_resolutions: int = 3,
     maximum_iterations: int = 256,
     number_of_spatial_samples: int = 4096,
