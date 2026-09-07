@@ -1,13 +1,10 @@
-"""Extract P31-14 features from existing registration outputs."""
 from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.cohort_a_loading import load_nifti_volume
 from src.lesion_features import extract_aligned_lesion_features, export_lesion_features
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -33,7 +30,6 @@ def main() -> None:
     )
     export_lesion_features(rows, args.out)
     print(f'Wrote {len(rows)} lesion features: {args.out}')
-
 
 if __name__ == '__main__':
     main()
