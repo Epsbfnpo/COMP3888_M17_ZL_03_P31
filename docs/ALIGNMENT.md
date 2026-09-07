@@ -11,6 +11,12 @@ This document describes the current **ITKElastix rigid-only alignment workflow**
 
 ## Quick Start
 
+Run the Streamlit dashboard with:
+
+```powershell
+python -m streamlit run tools/align_longitudinal_patient_v4_mapped.py
+```
+
 Run the Streamlit alignment dashboard **from the repository root**:
 
 ```bash
