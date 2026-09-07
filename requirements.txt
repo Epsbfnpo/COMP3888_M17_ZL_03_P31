@@ -6,5 +6,5 @@ pytest>=8.0
 matplotlib>=3.8
 
 # Medical image registration
-itk-elastix>=0.25.4
+itk-elastix==0.25.2
 streamlit>=1.40
