@@ -8,3 +8,6 @@ matplotlib>=3.8
 # Medical image registration
 itk-elastix==0.25.2
 streamlit>=1.40
+
+# Matching
+networkx>=3.3
