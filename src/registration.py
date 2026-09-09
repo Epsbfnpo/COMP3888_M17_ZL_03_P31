@@ -41,7 +41,11 @@ def _validate_ct_volume(volume: LoadedVolume, *, role: str) -> None:
         )
 
     spacing = np.asarray(volume.metadata.spacing_mm, dtype=float)
-    if spacing.shape != (3,) or not np.all(np.isfinite(spacing)) or np.any(spacing <= 0):
+    if (
+        spacing.shape != (3,)
+        or not np.all(np.isfinite(spacing))
+        or np.any(spacing <= 0)
+    ):
         raise RegistrationError(
             f"{role} CT has invalid voxel spacing: {volume.metadata.spacing_mm}"
         )
@@ -71,13 +75,24 @@ def _normalise_stages(stages: Iterable[str]) -> tuple[str, ...]:
     if len(set(normalised)) != len(normalised):
         raise ValueError("Registration stages must not contain duplicates.")
 
-    # For the initial stable pipeline, affine should refine rigid rather than
-    # being run before it.
     if "rigid" in normalised and "affine" in normalised:
         if normalised.index("rigid") > normalised.index("affine"):
             raise ValueError("When both are used, rigid must come before affine.")
 
     return normalised
+
+
+def _validate_required_ratio_of_valid_samples(
+    required_ratio_of_valid_samples: float | None,
+) -> None:
+    if required_ratio_of_valid_samples is None:
+        return
+
+    value = float(required_ratio_of_valid_samples)
+    if not np.isfinite(value) or not (0.0 < value <= 1.0):
+        raise ValueError(
+            "required_ratio_of_valid_samples must be in the interval (0, 1]."
+        )
 
 
 def _build_parameter_object(
@@ -86,13 +101,14 @@ def _build_parameter_object(
     number_of_resolutions: int,
     maximum_iterations: int,
     number_of_spatial_samples: int,
+    required_ratio_of_valid_samples: float | None = None,
 ):
     """
     Build conservative ITKElastix parameter maps.
 
-    The first implementation intentionally supports only rigid and affine
-    registration. Deformable/B-spline registration should be added only after
-    this baseline has been validated on representative Cohort A patients.
+    required_ratio_of_valid_samples is normally left as None, which preserves
+    the Elastix default.  A lower explicit value may be used by a controlled
+    fallback for BL/FU scans with substantially different fields of view.
     """
     if number_of_resolutions < 1:
         raise ValueError("number_of_resolutions must be >= 1")
@@ -100,6 +116,8 @@ def _build_parameter_object(
         raise ValueError("maximum_iterations must be >= 1")
     if number_of_spatial_samples < 128:
         raise ValueError("number_of_spatial_samples must be >= 128")
+
+    _validate_required_ratio_of_valid_samples(required_ratio_of_valid_samples)
 
     try:
         import itk
@@ -114,34 +132,28 @@ def _build_parameter_object(
     for stage in stages:
         parameter_map = parameter_object.GetDefaultParameterMap(stage)
 
-        # Use mutual information because it is robust for longitudinal CT
-        # scans whose intensity distributions may not be exactly identical.
         parameter_map["Metric"] = ["AdvancedMattesMutualInformation"]
 
-        # Multi-resolution registration is more robust to larger initial
-        # offsets while keeping the first prototype reasonably fast.
         parameter_map["NumberOfResolutions"] = [str(number_of_resolutions)]
         parameter_map["MaximumNumberOfIterations"] = [str(maximum_iterations)]
         parameter_map["NumberOfSpatialSamples"] = [str(number_of_spatial_samples)]
 
-        # Centre-based initialisation helps when BL/FU scans have different
-        # origins, fields of view, or numbers of slices.
         parameter_map["AutomaticTransformInitialization"] = ["true"]
         parameter_map["AutomaticTransformInitializationMethod"] = [
             "GeometricalCenter"
         ]
 
-        # Respect the physical image direction stored in the NIfTI geometry.
         parameter_map["UseDirectionCosines"] = ["true"]
-
-        # Voxels outside the moving BL image should represent air rather than
-        # Elastix's default 0 HU, which appears as a grey border in CT viewers.
         parameter_map["DefaultPixelValue"] = ["-1024"]
-
-        # Keep result-image generation enabled. Some elastix/ITKElastix
-        # execution paths expect an output image to be produced. We still save
-        # the final image ourselves below using a predictable project filename.
         parameter_map["WriteResultImage"] = ["true"]
+
+        # IMPORTANT:
+        # Do not lower this for normal patients.  The batch tool only supplies
+        # an explicit ratio when its normal rigid pass has already failed.
+        if required_ratio_of_valid_samples is not None:
+            parameter_map["RequiredRatioOfValidSamples"] = [
+                str(float(required_ratio_of_valid_samples))
+            ]
 
         parameter_object.AddParameterMap(parameter_map)
 
@@ -157,8 +169,6 @@ def _remove_previous_outputs(output_dir: Path) -> None:
     for path in output_dir.glob("TransformParameters.*.txt"):
         path.unlink()
 
-    # Elastix may also persist stage result images when an output directory is
-    # configured. Remove only its conventional result.* files from old runs.
     for path in output_dir.glob("result.*"):
         if path.is_file():
             path.unlink()
@@ -178,46 +188,18 @@ def register_ct_pair(
     number_of_resolutions: int = 3,
     maximum_iterations: int = 256,
     number_of_spatial_samples: int = 4096,
+    required_ratio_of_valid_samples: float | None = None,
     log_to_console: bool = False,
     overwrite: bool = True,
 ) -> RegistrationResult:
     """
     Register baseline CT into follow-up CT space using ITKElastix.
 
-    Parameters
-    ----------
-    baseline_ct:
-        Moving image. This image is transformed.
-    followup_ct:
-        Fixed/reference image. The registered baseline CT is resampled into
-        this image's geometry.
-    patient_id:
-        Identifier used only for diagnostics and the returned result.
-    output_dir:
-        Directory for the registered CT and elastix transform parameter files.
-    stages:
-        Registration stages. The stable default is rigid followed by affine.
-    number_of_resolutions:
-        Number of image-pyramid levels used by elastix.
-    maximum_iterations:
-        Maximum optimizer iterations per registration stage/resolution.
-    number_of_spatial_samples:
-        Number of sampled voxels used by the mutual-information metric.
-    log_to_console:
-        Whether elastix should print detailed optimisation logs.
-    overwrite:
-        If True, replace this module's previous outputs in output_dir.
-
-    Returns
-    -------
-    RegistrationResult
-        Registered baseline CT plus persisted transform parameter paths.
-
-    Notes
-    -----
-    ITK reads the original NIfTI files directly rather than converting the
-    NumPy arrays in LoadedVolume. This preserves spacing, origin and direction
-    and avoids manual RAS/LPS or axis-order conversion mistakes.
+    required_ratio_of_valid_samples:
+        Optional Elastix RequiredRatioOfValidSamples value.  Keep this as None
+        for the normal registration pass.  It exists so callers can explicitly
+        request a controlled low-overlap fallback without changing the default
+        behaviour of every patient.
     """
     _validate_ct_volume(baseline_ct, role="Baseline")
     _validate_ct_volume(followup_ct, role="Follow-up")
@@ -242,13 +224,13 @@ def register_ct_pair(
         number_of_resolutions=number_of_resolutions,
         maximum_iterations=maximum_iterations,
         number_of_spatial_samples=number_of_spatial_samples,
+        required_ratio_of_valid_samples=required_ratio_of_valid_samples,
     )
 
     try:
         import itk
 
         # Fixed = follow-up; moving = baseline.
-        # Explicit float input is appropriate for CT intensity registration.
         fixed_image = itk.imread(str(followup_ct.metadata.path), itk.F)
         moving_image = itk.imread(str(baseline_ct.metadata.path), itk.F)
 
@@ -260,7 +242,6 @@ def register_ct_pair(
         registration.SetOutputDirectory(str(out_dir))
         registration.SetLogToConsole(bool(log_to_console))
 
-        # Avoid an unnecessary log file when the API supports this method.
         if hasattr(registration, "SetLogToFile"):
             registration.SetLogToFile(False)
 
@@ -278,7 +259,7 @@ def register_ct_pair(
 
     if not registered_path.exists():
         raise RegistrationError(
-            f"Registration completed but no registered CT was written: "
+            "Registration completed but no registered CT was written: "
             f"{registered_path}"
         )
 
@@ -301,9 +282,6 @@ def register_ct_pair(
         role=f"{patient_id} registered BL CT",
     )
 
-    # A registered moving image must be resampled into the fixed FU geometry.
-    # This check is important because the matcher will compare BL and FU
-    # locations only after both are in the same spatial frame.
     if registered_volume.data.shape != followup_ct.data.shape:
         raise RegistrationError(
             "Registered BL CT does not match FU CT shape: "
@@ -340,26 +318,11 @@ def register_patient_ct(
     number_of_resolutions: int = 3,
     maximum_iterations: int = 256,
     number_of_spatial_samples: int = 4096,
+    required_ratio_of_valid_samples: float | None = None,
     log_to_console: bool = False,
     overwrite: bool = True,
 ) -> RegistrationResult:
-    """
-    Convenience wrapper for a loaded Cohort A patient pair.
-
-    Example
-    -------
-    pair = load_patient_pair(
-        "outputs/cohort_a_subset/cohort_a_subset_pairs.csv",
-        "0a09c8844b",
-        data_root="data/cohort_a",
-        modalities=("ct",),
-    )
-
-    result = register_patient_ct(
-        pair,
-        output_dir="outputs/registration/0a09c8844b",
-    )
-    """
+    """Convenience wrapper for a loaded Cohort A patient pair."""
     if pair.baseline.ct is None:
         raise RegistrationError(
             f"Patient '{pair.patient_id}' has no loaded baseline CT."
@@ -378,6 +341,7 @@ def register_patient_ct(
         number_of_resolutions=number_of_resolutions,
         maximum_iterations=maximum_iterations,
         number_of_spatial_samples=number_of_spatial_samples,
+        required_ratio_of_valid_samples=required_ratio_of_valid_samples,
         log_to_console=log_to_console,
         overwrite=overwrite,
     )
