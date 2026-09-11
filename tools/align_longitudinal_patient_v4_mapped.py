@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import streamlit as st
 
 # Allow:
@@ -21,6 +22,16 @@ from src.cohort_a_loading import (  # noqa: E402
     load_patient_pair,
 )
 from src.registration import RegistrationError, register_patient_ct  # noqa: E402
+from src.lesion_min_cost_flow import MatcherConfig  # noqa: E402
+from src.matching_dashboard import (  # noqa: E402
+    MatchImageFocus,
+    MatchingDashboardError,
+    load_patient_features,
+    load_patient_matches,
+    resolve_match_image_focus,
+    run_patient_match,
+    summarise_patient_matches,
+)
 from src.multiplanar_view import (  # noqa: E402
     PLANE_NAMES,
     anatomical_axis,
@@ -35,7 +46,10 @@ from src.multiplanar_view import (  # noqa: E402
 
 DEFAULT_PAIRS = "outputs/cohort_a_subset/cohort_a_subset_pairs.csv"
 DEFAULT_OUTPUT_ROOT = "outputs/registration"
-APP_VERSION = "V4.1 · Multiplanar CT/PET + masks + physical aspect"
+DEFAULT_MATCH_RESULTS = "outputs/tracking_pipeline_11/lesion_matches.csv"
+DEFAULT_ALIGNED_FEATURES = "outputs/tracking_pipeline_11/aligned_lesion_features.csv"
+DEFAULT_COST_MATRIX_DIR = "outputs/tracking_pipeline_11/lesion_pair_cost_matrices"
+APP_VERSION = "V4.2 · Multiplanar viewer + lesion correspondence"
 
 
 @st.cache_data(show_spinner=False)
@@ -368,6 +382,185 @@ def _mask_slice(
 def _normalise_optional_path(text: str) -> str | None:
     value = str(text).strip()
     return value if value else None
+
+
+def _render_matching_panel(
+    *,
+    patient_id: str,
+    results_path: Path,
+    feature_path: Path,
+    matrix_dir: Path,
+    run_matching: bool,
+    config: MatcherConfig,
+) -> MatchImageFocus | None:
+    """Run or load matching outcomes scoped to the currently selected patient."""
+    st.divider()
+    st.subheader("Lesion correspondence")
+    st.caption(
+        "Automatic BL ↔ FU outcomes for the patient shown in the aligned viewer. "
+        "Results refresh whenever the patient selection changes."
+    )
+
+    matrix_path = matrix_dir / f"{patient_id}_cost_matrix.csv"
+    if run_matching:
+        try:
+            with st.spinner(f"Running min-cost-flow matching for {patient_id}..."):
+                run_patient_match(matrix_path, patient_id, results_path, config)
+            st.success(f"Matching completed and saved to {results_path}")
+        except (FileNotFoundError, MatchingDashboardError) as exc:
+            st.error(str(exc))
+        except Exception as exc:
+            st.error(f"Unexpected matching failure for patient '{patient_id}': {exc}")
+
+    try:
+        matches = load_patient_matches(results_path, patient_id)
+    except FileNotFoundError as exc:
+        st.info(
+            f"{exc} Run matching from the sidebar after generating this "
+            "patient's cost matrix."
+        )
+        return None
+    except MatchingDashboardError as exc:
+        st.warning(str(exc))
+        return None
+
+    summary = summarise_patient_matches(matches, patient_id)
+    counts = summary.outcome_counts
+    metric_columns = st.columns(6)
+    metric_columns[0].metric("BL lesions", summary.baseline_lesions)
+    metric_columns[1].metric("FU lesions", summary.followup_lesions)
+    for column, match_type in zip(
+        metric_columns[2:],
+        ("MATCHED", "MERGING", "DISAPPEARING", "NEW"),
+    ):
+        column.metric(match_type.title(), counts.get(match_type, 0))
+
+    preferred_columns = [
+        "bl_lesion_id",
+        "fu_lesion_id",
+        "match_type",
+        "assignment_role",
+        "pair_cost",
+        "event_cost",
+        "match_cost",
+    ]
+    display_columns = [column for column in preferred_columns if column in matches]
+    st.dataframe(
+        matches[display_columns],
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.caption(f"Loaded from: {results_path}")
+
+    def _match_option_label(index: int) -> str:
+        row = matches.iloc[index]
+        bl_id = "—" if pd.isna(row.get("bl_lesion_id")) else str(row["bl_lesion_id"])
+        fu_id = "—" if pd.isna(row.get("fu_lesion_id")) else str(row["fu_lesion_id"])
+        return f"{row['match_type']} · {bl_id} → {fu_id}"
+
+    selected_index = st.selectbox(
+        "Inspect correspondence on aligned scans",
+        options=list(range(len(matches))),
+        format_func=_match_option_label,
+        key=f"selected_match_{patient_id}",
+    )
+    try:
+        features = load_patient_features(feature_path, patient_id)
+        focus = resolve_match_image_focus(matches.iloc[int(selected_index)], features)
+    except (FileNotFoundError, MatchingDashboardError) as exc:
+        st.warning(f"Matching table is available, but image linking is unavailable: {exc}")
+        return None
+
+    st.caption(f"Spatial locations loaded from: {feature_path}")
+    return focus
+
+
+def _centroid_marker_slice(
+    shape: tuple[int, int, int],
+    centroid_voxel: tuple[float, float, float],
+    *,
+    axis: int,
+    radius: int = 5,
+) -> tuple[np.ndarray, int]:
+    """Create a displayed 2-D marker at a 3-D voxel centroid."""
+    point = np.asarray(centroid_voxel, dtype=float)
+    if point.shape != (3,) or not np.all(np.isfinite(point)):
+        raise ValueError(f"Invalid lesion voxel centroid: {centroid_voxel!r}")
+    if any(value < -0.5 or value > size - 0.5 for value, size in zip(point, shape)):
+        raise ValueError(
+            f"Lesion centroid {centroid_voxel!r} is outside image shape {shape}."
+        )
+
+    slice_index = int(np.clip(np.rint(point[axis]), 0, shape[axis] - 1))
+    remaining_axes = [value for value in range(3) if value != axis]
+    raw_shape = (shape[remaining_axes[0]], shape[remaining_axes[1]])
+    raw_marker = np.zeros(raw_shape, dtype=bool)
+    centre_row = int(np.clip(np.rint(point[remaining_axes[0]]), 0, raw_shape[0] - 1))
+    centre_col = int(np.clip(np.rint(point[remaining_axes[1]]), 0, raw_shape[1] - 1))
+
+    rows, columns = np.ogrid[: raw_shape[0], : raw_shape[1]]
+    disk = (rows - centre_row) ** 2 + (columns - centre_col) ** 2 <= radius**2
+    raw_marker[disk] = True
+    return np.ascontiguousarray(np.flipud(np.rot90(raw_marker))), slice_index
+
+
+def _render_lesion_focus(
+    focus: MatchImageFocus,
+    *,
+    registered_display: np.ndarray,
+    fu_display: np.ndarray,
+    fu_ct: LoadedVolume,
+    modality: str,
+    plane_name: str,
+) -> None:
+    """Show selected BL/FU lesions on their own centroid slices in FU space."""
+    st.divider()
+    st.subheader("Selected correspondence on aligned scans")
+    st.caption(
+        f"{focus.match_type} · both panels use the common FU grid. The marker "
+        "shows the aligned lesion centroid; each side uses its own centroid slice."
+    )
+    info = plane_info(fu_ct, plane_name)
+    row_mm, col_mm = display_pixel_spacing_mm(fu_ct, plane_name)
+
+    def render_location(location, display, title: str) -> None:
+        if location is None:
+            st.info(f"No {title} lesion for this {focus.match_type} outcome.")
+            return
+        try:
+            marker, slice_index = _centroid_marker_slice(
+                tuple(int(value) for value in display.shape),
+                location.centroid_voxel,
+                axis=info.voxel_axis,
+            )
+            image = _uint8_slice(display, slice_index, axis=info.voxel_axis)
+            image = _overlay_mask(image, marker, alpha=0.75)
+            image = physical_aspect_resize(
+                image,
+                row_spacing_mm=row_mm,
+                column_spacing_mm=col_mm,
+            )
+        except Exception as exc:
+            st.error(f"Could not locate {location.lesion_id} on the scan: {exc}")
+            return
+
+        st.markdown(f"**{title}: {location.lesion_id}**")
+        st.image(
+            image,
+            caption=(
+                f"{plane_name} slice {slice_index + 1}/{info.slice_count} · "
+                f"centroid voxel ({location.centroid_voxel[0]:.1f}, "
+                f"{location.centroid_voxel[1]:.1f}, "
+                f"{location.centroid_voxel[2]:.1f})"
+            ),
+            use_container_width=True,
+        )
+
+    bl_column, fu_column = st.columns(2)
+    with bl_column:
+        render_location(focus.baseline, registered_display, f"Registered BL {modality}")
+    with fu_column:
+        render_location(focus.followup, fu_display, f"FU {modality}")
 
 
 def _registration_paths(
@@ -1162,6 +1355,50 @@ def main() -> None:
             ),
         )
 
+        st.header("Lesion matching")
+        match_results_text = st.text_input(
+            "Matching results CSV",
+            value=DEFAULT_MATCH_RESULTS,
+            help=(
+                "A combined lesion_matches.csv. Results for the selected patient "
+                "are loaded automatically."
+            ),
+        )
+        aligned_features_text = st.text_input(
+            "Aligned lesion features CSV",
+            value=DEFAULT_ALIGNED_FEATURES,
+            help=(
+                "Provides FU-grid BL/FU lesion centroids used to locate a "
+                "selected correspondence on the aligned scans."
+            ),
+        )
+        cost_matrix_dir_text = st.text_input(
+            "Cost matrix directory",
+            value=DEFAULT_COST_MATRIX_DIR,
+            help="Contains <patient_id>_cost_matrix.csv files.",
+        )
+        with st.expander("Matcher settings"):
+            disappearing_penalty = st.number_input(
+                "Disappearing penalty", min_value=0.0, value=1.0, step=0.1
+            )
+            new_lesion_penalty = st.number_input(
+                "New lesion penalty", min_value=0.0, value=1.0, step=0.1
+            )
+            merge_penalty = st.number_input(
+                "Merge penalty", min_value=0.0, value=0.2, step=0.1
+            )
+            max_bl_per_fu = st.number_input(
+                "Maximum BL lesions per FU lesion",
+                min_value=1,
+                value=3,
+                step=1,
+            )
+        run_matching = st.button(
+            "Run / re-run lesion matching",
+            use_container_width=True,
+            help="Runs NetworkX min-cost-flow for the selected patient only.",
+        )
+
     data_root = _normalise_optional_path(data_root_text)
     output_root = Path(output_root_text).expanduser()
     output_dir, registered_path, registered_mask_path = _registration_paths(
@@ -1194,6 +1431,20 @@ def main() -> None:
     top2.metric("View", plane_name)
     top3.metric("BL CT shape", " × ".join(map(str, bl_ct.data.shape)))
     top4.metric("FU CT shape", " × ".join(map(str, fu_ct.data.shape)))
+
+    match_image_focus = _render_matching_panel(
+        patient_id=patient_id,
+        results_path=Path(match_results_text).expanduser(),
+        feature_path=Path(aligned_features_text).expanduser(),
+        matrix_dir=Path(cost_matrix_dir_text).expanduser(),
+        run_matching=run_matching,
+        config=MatcherConfig(
+            disappearing_penalty=float(disappearing_penalty),
+            new_lesion_penalty=float(new_lesion_penalty),
+            merge_penalty=float(merge_penalty),
+            max_bl_per_fu=int(max_bl_per_fu),
+        ),
+    )
 
     if run_alignment:
         try:
@@ -1423,6 +1674,16 @@ def main() -> None:
         registered_bl_mask=registered_bl_mask,
         fu_mask=fu_mask,
     )
+
+    if match_image_focus is not None:
+        _render_lesion_focus(
+            match_image_focus,
+            registered_display=registered_display,
+            fu_display=fu_display,
+            fu_ct=fu_ct,
+            modality=display_modality,
+            plane_name=plane_name,
+        )
 
     with st.expander("Registration / viewer details"):
         st.write("BL CT source:", str(bl_ct.metadata.path))

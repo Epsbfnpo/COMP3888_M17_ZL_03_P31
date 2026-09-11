@@ -254,6 +254,20 @@ The same requirements are covered by automated tests:
 python -m pytest -q
 ```
 
+## Dashboard lesion correspondence
+
+The Streamlit multiplanar viewer can load saved min-cost-flow results, run
+matching for the currently selected patient directly from its labelled cost
+matrix, and select a correspondence to locate its BL/FU lesion centroids on
+the registered scans:
+
+```powershell
+streamlit run tools/align_longitudinal_patient_v4_mapped.py
+```
+
+See `docs/dashboard_lesion_matching.md` for inputs, output behaviour, and error
+handling.
+
 ## Acceptance-criteria mapping
 
 ### Load baseline and follow-up PET/CT volumes
