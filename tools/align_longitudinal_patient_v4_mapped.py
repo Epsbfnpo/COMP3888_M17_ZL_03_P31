@@ -45,7 +45,9 @@ DEFAULT_OUTPUT_ROOT = "outputs/registration"
 DEFAULT_MATCH_RESULTS = "outputs/tracking_pipeline_11/lesion_matches.csv"
 DEFAULT_ALIGNED_FEATURES = "outputs/tracking_pipeline_11/aligned_lesion_features.csv"
 DEFAULT_COST_MATRIX_DIR = "outputs/tracking_pipeline_11/lesion_pair_cost_matrices"
-APP_VERSION = "V4.2 · Multiplanar viewer + lesion correspondence"
+DEFAULT_PAIR_COSTS = "outputs/tracking_pipeline_11/lesion_pair_costs.csv"
+DEFAULT_EVALUATION_DETAILS = "outputs/tracking_evaluation_15/lesion_tracking_details.csv"
+APP_VERSION = "V4.3 · Alignment + detailed lesion correspondence"
 
 @st.cache_data(show_spinner=False)
 def _patient_ids(manifest_path: str, modified_ns: int) -> tuple[str, ...]:
@@ -328,23 +330,109 @@ def _normalise_optional_path(text: str) -> str | None:
     value = str(text).strip()
     return value if value else None
 
+def _normalise_optional_id(value: object) -> str | None:
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return None
+    return text
+
+
+def _safe_float(value: object) -> float | None:
+    try:
+        if pd.isna(value):
+            return None
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+@st.cache_data(show_spinner=False)
+def _load_csv_cached(path: str, modified_ns: int) -> pd.DataFrame:
+    # Cache auxiliary CSVs and invalidate when the file changes.
+    del modified_ns
+    return pd.read_csv(path)
+
+
+def _patient_auxiliary_rows(path: Path, patient_id: str) -> pd.DataFrame | None:
+    if not path.exists():
+        return None
+    frame = _load_csv_cached(str(path), path.stat().st_mtime_ns).copy()
+    if "patient_id" not in frame.columns:
+        return None
+    frame["patient_id"] = frame["patient_id"].astype(str).str.strip()
+    return frame[frame["patient_id"] == str(patient_id)].copy()
+
+
+def _event_row(
+    frame: pd.DataFrame | None,
+    *,
+    bl_lesion_id: str | None,
+    fu_lesion_id: str | None,
+) -> pd.Series | None:
+    if frame is None or frame.empty:
+        return None
+    if "bl_lesion_id" not in frame.columns or "fu_lesion_id" not in frame.columns:
+        return None
+
+    bl_values = frame["bl_lesion_id"].map(_normalise_optional_id)
+    fu_values = frame["fu_lesion_id"].map(_normalise_optional_id)
+    selected = frame[(bl_values == bl_lesion_id) & (fu_values == fu_lesion_id)]
+    if selected.empty:
+        return None
+    return selected.iloc[0]
+
+
+def _feature_row(
+    features: pd.DataFrame,
+    *,
+    timepoint: str,
+    lesion_id: str | None,
+) -> pd.Series | None:
+    if lesion_id is None or features.empty:
+        return None
+    required = {"timepoint", "lesion_id"}
+    if not required.issubset(features.columns):
+        return None
+    selected = features[
+        (features["timepoint"].astype(str).str.upper() == timepoint.upper())
+        & (features["lesion_id"].astype(str) == lesion_id)
+    ]
+    if selected.empty:
+        return None
+    return selected.iloc[0]
+
+
+def _format_metric_number(value: object, *, digits: int = 3, suffix: str = "") -> str:
+    number = _safe_float(value)
+    if number is None:
+        return "—"
+    return f"{number:.{digits}f}{suffix}"
+
+
 def _render_matching_panel(
     *,
     patient_id: str,
     results_path: Path,
     feature_path: Path,
     matrix_dir: Path,
+    pair_cost_path: Path,
+    evaluation_details_path: Path | None,
     run_matching: bool,
     config: MatcherConfig,
 ) -> MatchImageFocus | None:
-    #run or load matching results for the selected patient.
-    st.divider()
+    # Run/load matching, then expose the evidence required by Jira P31-21.
     st.subheader("Lesion correspondence")
     st.caption(
-        "Automatic BL ↔ FU outcomes for the patient shown in the aligned viewer. "
-        "Results refresh whenever the patient selection changes."
+        "Automatic BL ↔ FU outcomes for the selected patient. Select an event "
+        "to inspect lesion IDs, matcher features, cost/distance, unmatched status, "
+        "and ground-truth agreement when evaluation data is available."
     )
+
     matrix_path = matrix_dir / f"{patient_id}_cost_matrix.csv"
+
     if run_matching:
         try:
             with st.spinner(f"Running min-cost-flow matching for {patient_id}..."):
@@ -354,6 +442,7 @@ def _render_matching_panel(
             st.error(str(exc))
         except Exception as exc:
             st.error(f"Unexpected matching failure for patient '{patient_id}': {exc}")
+
     try:
         matches = load_patient_matches(results_path, patient_id)
     except FileNotFoundError as exc:
@@ -365,8 +454,14 @@ def _render_matching_panel(
     except MatchingDashboardError as exc:
         st.warning(str(exc))
         return None
+
+    if matches.empty:
+        st.info("No lesion correspondence rows are available for this patient.")
+        return None
+
     summary = summarise_patient_matches(matches, patient_id)
     counts = summary.outcome_counts
+
     metric_columns = st.columns(6)
     metric_columns[0].metric("BL lesions", summary.baseline_lesions)
     metric_columns[1].metric("FU lesions", summary.followup_lesions)
@@ -375,43 +470,295 @@ def _render_matching_panel(
         ("MATCHED", "MERGING", "DISAPPEARING", "NEW"),
     ):
         column.metric(match_type.title(), counts.get(match_type, 0))
+
+    # Make unmatched events explicit rather than relying only on a blank endpoint.
+    display_matches = matches.copy()
+
+    def _interpretation(row: pd.Series) -> str:
+        event_type = str(row.get("match_type", "")).upper()
+        if event_type == "DISAPPEARING":
+            return "Unmatched BL lesion (disappearing)"
+        if event_type == "NEW":
+            return "Unmatched FU lesion (new)"
+        if event_type == "MERGING":
+            return "BL lesion participates in merge"
+        return "BL ↔ FU correspondence"
+
+    display_matches["interpretation"] = display_matches.apply(_interpretation, axis=1)
+    for id_column in ("bl_lesion_id", "fu_lesion_id"):
+        if id_column in display_matches.columns:
+            display_matches[id_column] = display_matches[id_column].map(
+                lambda value: _normalise_optional_id(value) or "—"
+            )
+
     preferred_columns = [
         "bl_lesion_id",
         "fu_lesion_id",
         "match_type",
+        "interpretation",
         "assignment_role",
         "pair_cost",
         "event_cost",
         "match_cost",
     ]
-    display_columns = [column for column in preferred_columns if column in matches]
+    display_columns = [column for column in preferred_columns if column in display_matches]
+
     st.dataframe(
-        matches[display_columns],
+        display_matches[display_columns],
         hide_index=True,
         use_container_width=True,
     )
-    st.caption(f"Loaded from: {results_path}")
+    st.caption(f"Matching results: {results_path}")
 
     def _match_option_label(index: int) -> str:
         row = matches.iloc[index]
-        bl_id = "—" if pd.isna(row.get("bl_lesion_id")) else str(row["bl_lesion_id"])
-        fu_id = "—" if pd.isna(row.get("fu_lesion_id")) else str(row["fu_lesion_id"])
+        bl_id = _normalise_optional_id(row.get("bl_lesion_id")) or "—"
+        fu_id = _normalise_optional_id(row.get("fu_lesion_id")) or "—"
         return f"{row['match_type']} · {bl_id} → {fu_id}"
 
     selected_index = st.selectbox(
-        "Select BL lesion / correspondence (including appearing FU lesions)",
+        "Select lesion correspondence / unmatched event",
         options=list(range(len(matches))),
         format_func=_match_option_label,
         key=f"selected_match_{patient_id}",
     )
+
+    selected_match = matches.iloc[int(selected_index)]
+    bl_id = _normalise_optional_id(selected_match.get("bl_lesion_id"))
+    fu_id = _normalise_optional_id(selected_match.get("fu_lesion_id"))
+    match_type = str(selected_match.get("match_type", "")).upper()
+
+    # Load aligned features for selected-lesion details and image linking.
     try:
         features = load_patient_features(feature_path, patient_id)
-        focus = resolve_match_image_focus(matches.iloc[int(selected_index)], features)
     except (FileNotFoundError, MatchingDashboardError) as exc:
-        st.warning(f"Matching table is available, but image linking is unavailable: {exc}")
+        st.warning(f"Matching results are available, but feature details are unavailable: {exc}")
+        features = pd.DataFrame()
+
+    bl_feature = _feature_row(features, timepoint="BL", lesion_id=bl_id)
+    fu_feature = _feature_row(features, timepoint="FU", lesion_id=fu_id)
+
+    # Pair-cost CSV contains the actual feature breakdown used to construct candidate edges.
+    try:
+        pair_costs = _patient_auxiliary_rows(pair_cost_path, patient_id)
+    except Exception as exc:
+        st.warning(f"Could not read pair-cost details: {exc}")
+        pair_costs = None
+
+    pair_cost_row = _event_row(
+        pair_costs,
+        bl_lesion_id=bl_id,
+        fu_lesion_id=fu_id,
+    )
+
+    st.markdown("#### Selected match details")
+    overview = st.columns(4)
+    overview[0].metric("BL lesion ID", bl_id or "—")
+    overview[1].metric("FU lesion ID", fu_id or "—")
+    overview[2].metric("Outcome", match_type or "—")
+    overview[3].metric(
+        "Match cost",
+        _format_metric_number(selected_match.get("match_cost"), digits=4),
+    )
+
+    if match_type == "DISAPPEARING":
+        st.warning(f"{bl_id or 'BL lesion'} has no FU correspondence and is labelled DISAPPEARING.")
+    elif match_type == "NEW":
+        st.warning(f"{fu_id or 'FU lesion'} has no BL correspondence and is labelled NEW.")
+
+    # Feature block: show exact pair-cost inputs when a BL↔FU candidate exists.
+    st.markdown("#### Matcher features and cost")
+
+    if pair_cost_row is not None:
+        feature_metrics = st.columns(4)
+        feature_metrics[0].metric(
+            "Distance",
+            _format_metric_number(pair_cost_row.get("distance_mm"), digits=2, suffix=" mm"),
+        )
+        feature_metrics[1].metric(
+            "BL volume",
+            _format_metric_number(pair_cost_row.get("bl_volume_ml"), digits=3, suffix=" mL"),
+        )
+        feature_metrics[2].metric(
+            "FU volume",
+            _format_metric_number(pair_cost_row.get("fu_volume_ml"), digits=3, suffix=" mL"),
+        )
+        size_fraction = _safe_float(pair_cost_row.get("size_difference_fraction"))
+        feature_metrics[3].metric(
+            "Size difference",
+            "—" if size_fraction is None else f"{100.0 * size_fraction:.1f}%",
+        )
+
+        cost_fields = [
+            "distance_cost",
+            "size_cost",
+            "pet_cost",
+            "total_cost",
+            "candidate_rank_for_bl",
+            "pet_feature",
+            "bl_pet_value",
+            "fu_pet_value",
+            "pet_difference_fraction",
+            "pet_used",
+        ]
+        available_cost_fields = [field for field in cost_fields if field in pair_cost_row.index]
+        if available_cost_fields:
+            detail_table = pd.DataFrame(
+                {
+                    "Field": available_cost_fields,
+                    "Value": [pair_cost_row.get(field) for field in available_cost_fields],
+                }
+            )
+            with st.expander("Cost component details"):
+                st.dataframe(detail_table, hide_index=True, use_container_width=True)
+
+        st.caption(f"Matcher feature/cost source: {pair_cost_path}")
+    else:
+        # NEW/DISAPPEARING rows have no BL↔FU candidate edge. Show the available
+        # single-lesion features instead and make distance explicitly N/A.
+        feature_metrics = st.columns(4)
+        feature_metrics[0].metric("Distance", "N/A")
+        feature_metrics[1].metric(
+            "BL volume",
+            _format_metric_number(
+                None if bl_feature is None else bl_feature.get("volume_ml"),
+                digits=3,
+                suffix=" mL",
+            ),
+        )
+        feature_metrics[2].metric(
+            "FU volume",
+            _format_metric_number(
+                None if fu_feature is None else fu_feature.get("volume_ml"),
+                digits=3,
+                suffix=" mL",
+            ),
+        )
+        feature_metrics[3].metric("Size difference", "N/A")
+
+        if bl_id is not None and fu_id is not None:
+            st.info(
+                "No matching row was found in the pair-cost detail CSV for this BL/FU pair. "
+                "Check that the pair-cost CSV belongs to the same pipeline run as the match results."
+            )
+        else:
+            st.caption(
+                "Distance and pairwise size difference are not applicable to NEW/DISAPPEARING "
+                "events because one endpoint is absent. The displayed match cost is the unmatched "
+                "event penalty used by the flow model."
+            )
+
+    # Ground-truth agreement is read only from evaluation output. The dashboard does
+    # not use GT to make or change the prediction.
+    st.markdown("#### Ground-truth agreement")
+
+    evaluation_rows = None
+    if evaluation_details_path is not None:
+        try:
+            evaluation_rows = _patient_auxiliary_rows(evaluation_details_path, patient_id)
+        except Exception as exc:
+            st.warning(f"Could not read ground-truth evaluation details: {exc}")
+
+    if evaluation_details_path is None or not evaluation_details_path.exists():
+        st.info(
+            "Ground-truth evaluation is unavailable for this view. Provide a "
+            "lesion_tracking_details.csv path in the sidebar to enable it."
+        )
+    elif evaluation_rows is None or evaluation_rows.empty:
+        st.info(
+            "The evaluation details file exists, but it contains no scored rows "
+            f"for patient {patient_id}."
+        )
+    else:
+        evaluation_row = _event_row(
+            evaluation_rows,
+            bl_lesion_id=bl_id,
+            fu_lesion_id=fu_id,
+        )
+
+        if evaluation_row is None:
+            st.info(
+                "No evaluation row matches this predicted event. Verify that the "
+                "evaluation file was generated from the same lesion_matches.csv."
+            )
+        else:
+            gt_status = str(evaluation_row.get("status", "")).upper()
+            gt_type = _normalise_optional_id(evaluation_row.get("ground_truth_type")) or "—"
+            predicted_type = _normalise_optional_id(evaluation_row.get("predicted_type")) or match_type or "—"
+            topology_correct = bool(evaluation_row.get("topology_correct", False))
+
+            if gt_status == "CORRECT" and topology_correct:
+                st.success(
+                    f"✓ CORRECT — the BL/FU endpoints and event type agree with ground truth "
+                    f"({gt_type})."
+                )
+            elif gt_status == "CORRECT":
+                st.warning(
+                    "✓ Endpoint correspondence agrees with ground truth, but the event type differs: "
+                    f"predicted {predicted_type}, ground truth {gt_type}."
+                )
+            elif gt_status == "INCORRECT":
+                st.error(
+                    "✗ INCORRECT — this predicted BL/FU event is not present in the ground-truth "
+                    "link set."
+                )
+            else:
+                st.info(f"Evaluation status: {gt_status or 'unknown'}")
+
+            gt_columns = st.columns(3)
+            gt_columns[0].metric("Evaluation", gt_status or "—")
+            gt_columns[1].metric("Predicted type", predicted_type)
+            gt_columns[2].metric("Ground-truth type", gt_type)
+
+        missed = evaluation_rows[
+            evaluation_rows.get("status", pd.Series(index=evaluation_rows.index, dtype=str))
+            .astype(str)
+            .str.upper()
+            .eq("MISSED")
+        ].copy()
+        if not missed.empty:
+            missed_columns = [
+                column
+                for column in (
+                    "bl_lesion_id",
+                    "fu_lesion_id",
+                    "ground_truth_type",
+                    "expert_lesion_id",
+                )
+                if column in missed.columns
+            ]
+            with st.expander(f"Missed ground-truth events for this patient ({len(missed)})"):
+                st.caption(
+                    "These events exist in ground truth but are absent from the predicted match set."
+                )
+                st.dataframe(
+                    missed[missed_columns],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+        st.caption(f"Evaluation source: {evaluation_details_path}")
+
+    if run_matching and evaluation_details_path is not None and evaluation_details_path.exists():
+        st.caption(
+            "Note: re-running matching in the dashboard does not automatically recompute "
+            "ground-truth evaluation. Re-run the evaluation pipeline before treating the "
+            "displayed GT status as current."
+        )
+
+    # Preserve existing image-linking behaviour.
+    if features.empty:
         return None
+
+    try:
+        focus = resolve_match_image_focus(selected_match, features)
+    except MatchingDashboardError as exc:
+        st.warning(f"Match details are available, but image linking is unavailable: {exc}")
+        return None
+
     st.caption(f"Spatial locations loaded from: {feature_path}")
     return focus
+
 
 def _centroid_marker_slice(
     shape: tuple[int, int, int],
@@ -1180,6 +1527,22 @@ def main() -> None:
             value=DEFAULT_COST_MATRIX_DIR,
             help="Contains <patient_id>_cost_matrix.csv files.",
         )
+        pair_costs_text = st.text_input(
+            "Pair-cost details CSV",
+            value=DEFAULT_PAIR_COSTS,
+            help=(
+                "Optional long-form lesion_pair_costs.csv used to show distance, "
+                "volume, size difference, PET features, and cost components."
+            ),
+        )
+        evaluation_details_text = st.text_input(
+            "Ground-truth evaluation details CSV",
+            value=DEFAULT_EVALUATION_DETAILS,
+            help=(
+                "Optional lesion_tracking_details.csv. When available, the selected "
+                "prediction is labelled CORRECT/INCORRECT and missed GT events are shown."
+            ),
+        )
         with st.expander("Matcher settings"):
             disappearing_penalty = st.number_input(
                 "Disappearing penalty", min_value=0.0, value=1.0, step=0.1
@@ -1229,19 +1592,7 @@ def main() -> None:
     top2.metric("View", plane_name)
     top3.metric("BL CT shape", " × ".join(map(str, bl_ct.data.shape)))
     top4.metric("FU CT shape", " × ".join(map(str, fu_ct.data.shape)))
-    match_image_focus = _render_matching_panel(
-        patient_id=patient_id,
-        results_path=Path(match_results_text).expanduser(),
-        feature_path=Path(aligned_features_text).expanduser(),
-        matrix_dir=Path(cost_matrix_dir_text).expanduser(),
-        run_matching=run_matching,
-        config=MatcherConfig(
-            disappearing_penalty=float(disappearing_penalty),
-            new_lesion_penalty=float(new_lesion_penalty),
-            merge_penalty=float(merge_penalty),
-            max_bl_per_fu=int(max_bl_per_fu),
-        ),
-    )
+    match_image_focus = None
     if run_alignment:
         try:
             with st.spinner(f"Registering {patient_id}: rigid only..."):
@@ -1318,7 +1669,7 @@ def main() -> None:
     bl_mask = pair.baseline.lesion_mask
     fu_mask = pair.followup.lesion_mask
     registered_bl_mask = None
-    if show_masks or match_image_focus is not None:
+    if show_masks:
         if bl_mask is None or fu_mask is None:
             st.warning(
                 "Lesion-mask overlay requested, but this patient does not have "
@@ -1455,11 +1806,68 @@ def main() -> None:
         registered_bl_mask=registered_bl_mask,
         fu_mask=fu_mask,
     )
+
+    # Matching is intentionally rendered after the complete alignment viewer.
+    st.divider()
+    st.header("Lesion Matching")
+
+    evaluation_details_path = None
+    if str(evaluation_details_text).strip():
+        evaluation_details_path = Path(evaluation_details_text).expanduser()
+
+    match_image_focus = _render_matching_panel(
+        patient_id=patient_id,
+        results_path=Path(match_results_text).expanduser(),
+        feature_path=Path(aligned_features_text).expanduser(),
+        matrix_dir=Path(cost_matrix_dir_text).expanduser(),
+        pair_cost_path=Path(pair_costs_text).expanduser(),
+        evaluation_details_path=evaluation_details_path,
+        run_matching=run_matching,
+        config=MatcherConfig(
+            disappearing_penalty=float(disappearing_penalty),
+            new_lesion_penalty=float(new_lesion_penalty),
+            merge_penalty=float(merge_penalty),
+            max_bl_per_fu=int(max_bl_per_fu),
+        ),
+    )
+
     if match_image_focus is not None:
+        # The selected correspondence image needs the registered BL mask even if
+        # the alignment-view mask checkbox is OFF, so prepare it lazily here.
+        if registered_bl_mask is None and bl_mask is not None:
+            try:
+                _validate_image_mask_geometry(bl_ct, bl_mask, label="Baseline")
+                with st.spinner(
+                    "Preparing registered BL lesion mask for matching visualisation..."
+                ):
+                    _warp_baseline_mask_to_fu(
+                        bl_mask,
+                        transform_path=transform_path,
+                        registered_mask_path=registered_mask_path,
+                    )
+                registered_bl_mask = _load_registered_mask_cached(
+                    str(registered_mask_path),
+                    registered_mask_path.stat().st_mtime_ns,
+                )
+                _validate_image_mask_geometry(
+                    fu_ct,
+                    registered_bl_mask,
+                    label="Registered BL mask / FU",
+                )
+            except Exception as exc:
+                st.warning(
+                    "Could not prepare the registered BL lesion mask for matching "
+                    f"visualisation: {exc}"
+                )
+
         _render_lesion_focus(
             match_image_focus,
-            registered_display=_prepare_display_volume(registered_bl.data, low_hu=-160, high_hu=240),
-            fu_display=_prepare_display_volume(fu_ct.data, low_hu=-160, high_hu=240),
+            registered_display=_prepare_display_volume(
+                registered_bl.data, low_hu=-160, high_hu=240
+            ),
+            fu_display=_prepare_display_volume(
+                fu_ct.data, low_hu=-160, high_hu=240
+            ),
             fu_ct=fu_ct,
             modality="CT",
             plane_name=plane_name,
