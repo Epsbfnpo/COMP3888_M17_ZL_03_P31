@@ -27,7 +27,13 @@ from src.matching_dashboard import (  # noqa: E402
     load_patient_matches,
     resolve_match_image_focus,
     run_patient_match,
-    summarise_patient_matches,
+)
+from src.tracking_summary import (  # noqa: E402
+    TrackingSummaryError,
+    build_tracking_summary,
+    load_evaluation_summary,
+    load_tracking_matches,
+    summarise_patient_tracking,
 )
 from src.multiplanar_view import (  # noqa: E402
     PLANE_NAMES,
@@ -47,7 +53,8 @@ DEFAULT_ALIGNED_FEATURES = "outputs/tracking_pipeline_11/aligned_lesion_features
 DEFAULT_COST_MATRIX_DIR = "outputs/tracking_pipeline_11/lesion_pair_cost_matrices"
 DEFAULT_PAIR_COSTS = "outputs/tracking_pipeline_11/lesion_pair_costs.csv"
 DEFAULT_EVALUATION_DETAILS = "outputs/tracking_evaluation_15/lesion_tracking_details.csv"
-APP_VERSION = "V4.3 · Alignment + detailed lesion correspondence"
+DEFAULT_EVALUATION_SUMMARY = "outputs/tracking_evaluation_15/lesion_tracking_summary.csv"
+APP_VERSION = "V4.4 · Alignment + tracking summary"
 
 @st.cache_data(show_spinner=False)
 def _patient_ids(manifest_path: str, modified_ns: int) -> tuple[str, ...]:
@@ -420,6 +427,7 @@ def _render_matching_panel(
     matrix_dir: Path,
     pair_cost_path: Path,
     evaluation_details_path: Path | None,
+    evaluation_summary_path: Path | None,
     run_matching: bool,
     config: MatcherConfig,
 ) -> MatchImageFocus | None:
@@ -459,17 +467,167 @@ def _render_matching_panel(
         st.info("No lesion correspondence rows are available for this patient.")
         return None
 
-    summary = summarise_patient_matches(matches, patient_id)
-    counts = summary.outcome_counts
+    # P31-22 patient-level summary. Structural counts always come from the
+    # matcher output; ground-truth accuracy is attached only when the P31-18
+    # evaluation summary is available.
+    evaluation_summary = None
+    evaluation_summary_warning = None
+    if evaluation_summary_path is not None:
+        try:
+            evaluation_summary = load_evaluation_summary(evaluation_summary_path)
+        except FileNotFoundError:
+            evaluation_summary_warning = (
+                f"Ground-truth evaluation summary was not found: {evaluation_summary_path}"
+            )
+        except TrackingSummaryError as exc:
+            evaluation_summary_warning = str(exc)
 
-    metric_columns = st.columns(6)
-    metric_columns[0].metric("BL lesions", summary.baseline_lesions)
-    metric_columns[1].metric("FU lesions", summary.followup_lesions)
-    for column, match_type in zip(
-        metric_columns[2:],
-        ("MATCHED", "MERGING", "DISAPPEARING", "NEW"),
-    ):
-        column.metric(match_type.title(), counts.get(match_type, 0))
+    try:
+        patient_summary = summarise_patient_tracking(
+            matches,
+            patient_id,
+            evaluation_summary=evaluation_summary,
+        )
+    except TrackingSummaryError as exc:
+        st.warning(f"Could not build patient tracking summary: {exc}")
+        patient_summary = None
+
+    st.markdown("#### Tracking summary")
+    if patient_summary is not None:
+        summary_row_1 = st.columns(4)
+        summary_row_1[0].metric("BL lesions", int(patient_summary["bl_lesions"]))
+        summary_row_1[1].metric("FU lesions", int(patient_summary["fu_lesions"]))
+        summary_row_1[2].metric(
+            "Matched lesions", int(patient_summary["matched_lesions"])
+        )
+        summary_row_1[3].metric(
+            "Unmatched events", int(patient_summary["unmatched_lesions"])
+        )
+
+        summary_row_2 = st.columns(5)
+        summary_row_2[0].metric(
+            "Appearing (NEW)", int(patient_summary["appearing_lesions"])
+        )
+        summary_row_2[1].metric(
+            "Disappearing", int(patient_summary["disappearing_lesions"])
+        )
+
+        if bool(patient_summary["ground_truth_available"]):
+            summary_row_2[2].metric(
+                "Correct matches", int(patient_summary["correct_matches"])
+            )
+            summary_row_2[3].metric(
+                "Incorrect matches", int(patient_summary["incorrect_matches"])
+            )
+            summary_row_2[4].metric(
+                "Tracking accuracy",
+                f"{100.0 * float(patient_summary['tracking_accuracy']):.1f}%",
+            )
+        else:
+            summary_row_2[2].metric("Correct matches", "N/A")
+            summary_row_2[3].metric("Incorrect matches", "N/A")
+            summary_row_2[4].metric("Tracking accuracy", "N/A")
+
+        st.caption(
+            "Matched lesions = unique BL lesions assigned to a FU lesion, including "
+            "BL lesions participating in MERGING. Unmatched events = appearing + "
+            "disappearing lesions across the two timepoints."
+        )
+
+        # Preserve the earlier dashboard's explicit matcher-outcome counts.  These
+        # are row/event counts, whereas the P31-22 cards above use unique-lesion
+        # counts where appropriate.
+        outcome_counts = (
+            matches["match_type"].astype(str).str.strip().str.upper().value_counts()
+        )
+        with st.expander("Matcher outcome counts"):
+            outcome_columns = st.columns(4)
+            for column, match_type in zip(
+                outcome_columns,
+                ("MATCHED", "MERGING", "DISAPPEARING", "NEW"),
+            ):
+                column.metric(match_type.title(), int(outcome_counts.get(match_type, 0)))
+            st.caption(
+                "These are matcher output rows/events. MERGING may contain multiple "
+                "BL rows for the same FU lesion."
+            )
+
+        evaluation_status = str(patient_summary.get("evaluation_status", "")).strip()
+        evaluation_error = str(patient_summary.get("evaluation_error", "")).strip()
+        if evaluation_status.upper().startswith("FAILED"):
+            st.warning(
+                "Ground-truth evaluation exists but failed for this patient"
+                + (f": {evaluation_error}" if evaluation_error else ".")
+            )
+        elif evaluation_summary_warning:
+            st.caption(
+                "Ground-truth metrics are optional. " + evaluation_summary_warning
+            )
+
+    # Optional tested-subset summary for P31-22. It reuses the same combined
+    # lesion_matches.csv and the P31-18 evaluation summary; no matching is rerun.
+    with st.expander("Tested Cohort A subset summary"):
+        try:
+            all_matches = load_tracking_matches(results_path)
+            cohort_summary = build_tracking_summary(
+                all_matches,
+                evaluation_summary=evaluation_summary,
+                include_overall=True,
+            )
+            display_summary = cohort_summary.copy()
+            if "tracking_accuracy" in display_summary:
+                display_summary["tracking_accuracy"] = display_summary[
+                    "tracking_accuracy"
+                ].map(
+                    lambda value: (
+                        "N/A"
+                        if pd.isna(value)
+                        else f"{100.0 * float(value):.1f}%"
+                    )
+                )
+            cohort_columns = [
+                "patient_id",
+                "bl_lesions",
+                "fu_lesions",
+                "matched_lesions",
+                "appearing_lesions",
+                "disappearing_lesions",
+                "correct_matches",
+                "incorrect_matches",
+                "tracking_accuracy",
+                "evaluation_status",
+            ]
+            st.dataframe(
+                display_summary[cohort_columns],
+                hide_index=True,
+                use_container_width=True,
+            )
+            overall = cohort_summary.loc[cohort_summary["patient_id"] == "ALL"]
+            if not overall.empty:
+                row = overall.iloc[0]
+                overall_cols = st.columns(4)
+                overall_cols[0].metric("Patients", len(cohort_summary) - 1)
+                overall_cols[1].metric(
+                    "Matched lesions", int(row["matched_lesions"])
+                )
+                overall_cols[2].metric(
+                    "Unmatched events", int(row["unmatched_lesions"])
+                )
+                if bool(row["ground_truth_available"]):
+                    overall_cols[3].metric(
+                        "Overall tracking accuracy",
+                        f"{100.0 * float(row['tracking_accuracy']):.1f}%",
+                    )
+                else:
+                    overall_cols[3].metric("Overall tracking accuracy", "N/A")
+            st.caption(
+                "The ALL row sums structural lesion counts across patients. "
+                "When P31-18 ground truth is available, overall accuracy uses the "
+                "evaluation pipeline's combined ALL result rather than averaging "
+                "patient percentages."
+            )
+        except (FileNotFoundError, TrackingSummaryError) as exc:
+            st.info(f"Cohort-level summary is unavailable: {exc}")
 
     # Make unmatched events explicit rather than relying only on a blank endpoint.
     display_matches = matches.copy()
@@ -1543,6 +1701,15 @@ def main() -> None:
                 "prediction is labelled CORRECT/INCORRECT and missed GT events are shown."
             ),
         )
+        evaluation_summary_text = st.text_input(
+            "Ground-truth evaluation summary CSV",
+            value=DEFAULT_EVALUATION_SUMMARY,
+            help=(
+                "Optional lesion_tracking_summary.csv from P31-18. Used for "
+                "per-patient correct/incorrect counts, tracking accuracy, and the "
+                "tested-subset ALL result."
+            ),
+        )
         with st.expander("Matcher settings"):
             disappearing_penalty = st.number_input(
                 "Disappearing penalty", min_value=0.0, value=1.0, step=0.1
@@ -1814,6 +1981,9 @@ def main() -> None:
     evaluation_details_path = None
     if str(evaluation_details_text).strip():
         evaluation_details_path = Path(evaluation_details_text).expanduser()
+    evaluation_summary_path = None
+    if str(evaluation_summary_text).strip():
+        evaluation_summary_path = Path(evaluation_summary_text).expanduser()
 
     match_image_focus = _render_matching_panel(
         patient_id=patient_id,
@@ -1822,6 +1992,7 @@ def main() -> None:
         matrix_dir=Path(cost_matrix_dir_text).expanduser(),
         pair_cost_path=Path(pair_costs_text).expanduser(),
         evaluation_details_path=evaluation_details_path,
+        evaluation_summary_path=evaluation_summary_path,
         run_matching=run_matching,
         config=MatcherConfig(
             disappearing_penalty=float(disappearing_penalty),
