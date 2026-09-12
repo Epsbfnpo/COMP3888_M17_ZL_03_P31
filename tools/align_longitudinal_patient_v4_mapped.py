@@ -1,16 +1,12 @@
 from __future__ import annotations
-
 import os
 import sys
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Allow:
-#   streamlit run tools/align_longitudinal_patient_v4_mapped.py
-# from the repository root without installing src as a package.
+#allow streamlit to run from the project root without installing src
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -22,6 +18,7 @@ from src.cohort_a_loading import (  # noqa: E402
     load_patient_pair,
 )
 from src.registration import RegistrationError, register_patient_ct  # noqa: E402
+from src.correspondence_visualization import OUTCOME_STYLES, selected_lesion_mask, lesion_display_slice
 from src.lesion_min_cost_flow import MatcherConfig  # noqa: E402
 from src.matching_dashboard import (  # noqa: E402
     MatchImageFocus,
@@ -43,7 +40,6 @@ from src.multiplanar_view import (  # noqa: E402
     slice_centre_world_mm,
 )
 
-
 DEFAULT_PAIRS = "outputs/cohort_a_subset/cohort_a_subset_pairs.csv"
 DEFAULT_OUTPUT_ROOT = "outputs/registration"
 DEFAULT_MATCH_RESULTS = "outputs/tracking_pipeline_11/lesion_matches.csv"
@@ -51,18 +47,16 @@ DEFAULT_ALIGNED_FEATURES = "outputs/tracking_pipeline_11/aligned_lesion_features
 DEFAULT_COST_MATRIX_DIR = "outputs/tracking_pipeline_11/lesion_pair_cost_matrices"
 APP_VERSION = "V4.2 · Multiplanar viewer + lesion correspondence"
 
-
 @st.cache_data(show_spinner=False)
 def _patient_ids(manifest_path: str, modified_ns: int) -> tuple[str, ...]:
-    """Read patient IDs from a pair manifest."""
-    del modified_ns  # Used only to invalidate the cache if the manifest changes.
+    #read patient ids from pair manifest.
+    del modified_ns  #used only to invalidate the cache when manifest changes
     manifest = load_pair_manifest(manifest_path)
     return tuple(
         str(value).strip()
         for value in manifest["patient_id"].tolist()
         if str(value).strip()
     )
-
 
 @st.cache_resource(show_spinner=False)
 def _load_pair_cached(
@@ -72,7 +66,7 @@ def _load_pair_cached(
     manifest_modified_ns: int,
     load_pet: bool,
 ):
-    """Load the volumes needed by the current dashboard mode once."""
+    #cache the volumes needed for the selected dashboard mode
     del manifest_modified_ns
     modalities = ("ct", "pet", "lesion_mask") if load_pet else ("ct", "lesion_mask")
     return load_patient_pair(
@@ -83,26 +77,24 @@ def _load_pair_cached(
         allow_missing=True,
     )
 
-
 @st.cache_resource(show_spinner=False)
 def _load_registered_ct_cached(
     registered_path: str,
     modified_ns: int,
 ) -> LoadedVolume:
-    """Load the registered CT once and reuse it between Streamlit reruns."""
+    #cache registered CT data across streamlit reruns
     del modified_ns
     return load_nifti_volume(
         registered_path,
         role="registered baseline CT",
     )
 
-
 @st.cache_resource(show_spinner=False)
 def _load_registered_mask_cached(
     registered_mask_path: str,
     modified_ns: int,
 ) -> LoadedVolume:
-    """Load a rigidly transformed BL lesion mask once."""
+    #cache the rigidly transformed BL lesion mask
     del modified_ns
     return load_nifti_volume(
         registered_mask_path,
@@ -110,20 +102,17 @@ def _load_registered_mask_cached(
         preserve_dtype=True,
     )
 
-
 @st.cache_resource(show_spinner=False)
 def _load_registered_pet_cached(
     registered_pet_path: str,
     modified_ns: int,
 ) -> LoadedVolume:
-    """Load a rigidly transformed BL PET volume once."""
+    #cache the rigidly transformed BL PET volume
     del modified_ns
     return load_nifti_volume(
         registered_pet_path,
         role="registered baseline PET",
     )
-
-
 
 def _validate_image_mask_geometry(
     image: LoadedVolume,
@@ -136,7 +125,6 @@ def _validate_image_mask_geometry(
             f"{label} CT/mask shape mismatch: "
             f"{image.data.shape} vs {mask.data.shape}."
         )
-
     if not np.allclose(
         image.metadata.affine,
         mask.metadata.affine,
@@ -145,7 +133,6 @@ def _validate_image_mask_geometry(
     ):
         raise ValueError(f"{label} CT/mask affine geometry does not match.")
 
-
 def _registered_mask_needs_update(
     registered_mask_path: Path,
     baseline_mask_path: Path,
@@ -153,7 +140,6 @@ def _registered_mask_needs_update(
 ) -> bool:
     if not registered_mask_path.exists():
         return True
-
     try:
         output_time = registered_mask_path.stat().st_mtime_ns
         return (
@@ -163,44 +149,33 @@ def _registered_mask_needs_update(
     except OSError:
         return True
 
-
 def _warp_baseline_mask_to_fu(
     baseline_mask: LoadedVolume,
     *,
     transform_path: Path,
     registered_mask_path: Path,
 ) -> Path:
-    """
-    Apply the saved rigid BL→FU transform to the BL lesion mask.
-
-    Nearest-neighbour interpolation is mandatory for label masks so the
-    transformation does not create fractional lesion labels.
-    """
+    #apply the saved BL-to-FU transform with nearest-neighbour interpolation to preserve mask labels
     if not transform_path.exists():
         raise FileNotFoundError(
             f"Rigid transform not found: {transform_path}"
         )
-
     registered_mask_path.parent.mkdir(parents=True, exist_ok=True)
-
     if not _registered_mask_needs_update(
         registered_mask_path,
         baseline_mask.metadata.path,
         transform_path,
     ):
         return registered_mask_path
-
     try:
         import itk
     except ImportError as exc:
         raise RuntimeError(
             "ITKElastix is required to transform lesion masks."
         ) from exc
-
     parameter_object = itk.ParameterObject.New()
     parameter_object.AddParameterFile(str(transform_path))
-
-    # Preserve label semantics.
+    #preserve label semantics.
     parameter_object.SetParameter(
         0,
         "ResampleInterpolator",
@@ -216,25 +191,19 @@ def _warp_baseline_mask_to_fu(
         "DefaultPixelValue",
         "0",
     )
-
     moving_mask = itk.imread(
         str(baseline_mask.metadata.path),
         itk.US,
     )
-
     transformix = itk.TransformixFilter.New(moving_mask)
     transformix.SetTransformParameterObject(parameter_object)
     transformix.SetLogToConsole(False)
-
     if hasattr(transformix, "SetLogToFile"):
         transformix.SetLogToFile(False)
-
     transformix.UpdateLargestPossibleRegion()
     result_mask = transformix.GetOutput()
-
     itk.imwrite(result_mask, str(registered_mask_path))
     return registered_mask_path
-
 
 def _registered_pet_needs_update(
     registered_pet_path: Path,
@@ -243,7 +212,6 @@ def _registered_pet_needs_update(
 ) -> bool:
     if not registered_pet_path.exists():
         return True
-
     try:
         output_time = registered_pet_path.stat().st_mtime_ns
         return (
@@ -253,38 +221,31 @@ def _registered_pet_needs_update(
     except OSError:
         return True
 
-
 def _warp_baseline_pet_to_fu(
     baseline_pet: LoadedVolume,
     *,
     transform_path: Path,
     registered_pet_path: Path,
 ) -> Path:
-    """Apply the saved rigid BL→FU transform to PET using linear interpolation."""
+    #apply the saved BL-to-FU transform to PET with linear interpolation
     if not transform_path.exists():
         raise FileNotFoundError(f"Rigid transform not found: {transform_path}")
-
     registered_pet_path.parent.mkdir(parents=True, exist_ok=True)
-
     if not _registered_pet_needs_update(
         registered_pet_path,
         baseline_pet.metadata.path,
         transform_path,
     ):
         return registered_pet_path
-
     try:
         import itk
     except ImportError as exc:
         raise RuntimeError(
             "ITKElastix is required to transform baseline PET into FU space."
         ) from exc
-
     parameter_object = itk.ParameterObject.New()
     parameter_object.AddParameterFile(str(transform_path))
-
-    # PET is continuous intensity data, so use first-order B-spline (linear)
-    # interpolation rather than nearest-neighbour mask interpolation.
+    #use linear interpolation for continuous PET intensities
     parameter_object.SetParameter(
         0,
         "ResampleInterpolator",
@@ -297,74 +258,58 @@ def _warp_baseline_pet_to_fu(
     )
     parameter_object.SetParameter(0, "DefaultPixelValue", "0")
     parameter_object.SetParameter(0, "ResultImagePixelType", "float")
-
     moving_pet = itk.imread(str(baseline_pet.metadata.path), itk.F)
-
     transformix = itk.TransformixFilter.New(moving_pet)
     transformix.SetTransformParameterObject(parameter_object)
     transformix.SetLogToConsole(False)
     if hasattr(transformix, "SetLogToFile"):
         transformix.SetLogToFile(False)
-
     transformix.UpdateLargestPossibleRegion()
     itk.imwrite(transformix.GetOutput(), str(registered_pet_path))
     return registered_pet_path
-
 
 def _overlay_mask(
     grayscale: np.ndarray,
     mask: np.ndarray | None,
     *,
     alpha: float = 0.48,
+    colour: tuple[int, int, int] = (255, 64, 32),
 ) -> np.ndarray:
-    """
-    Overlay positive mask voxels on a uint8 CT slice.
-
-    Returns RGB uint8 data suitable for st.image.
-    """
+    #overlay mask voxels on a CT slice and return uint8 RGB data for streamlit
     base = np.asarray(grayscale, dtype=np.uint8)
-
     if base.ndim != 2:
         raise ValueError(f"Expected 2-D grayscale slice, got {base.shape}.")
-
     rgb = np.repeat(base[..., None], 3, axis=2)
-
     if mask is None:
         return rgb
-
     lesion = np.asarray(mask) > 0
     if lesion.shape != base.shape:
         raise ValueError(
             f"Mask slice shape {lesion.shape} does not match CT slice "
             f"shape {base.shape}."
         )
-
     if not np.any(lesion):
         return rgb
-
-    # Warm red/orange overlay. Keep some underlying CT visible.
-    overlay_colour = np.asarray([255.0, 64.0, 32.0], dtype=np.float32)
+    #keep the underlying CT visible through the mask colour
+    overlay_colour = np.asarray(colour, dtype=np.float32)
     pixels = rgb[lesion].astype(np.float32)
     pixels = (1.0 - alpha) * pixels + alpha * overlay_colour
     rgb[lesion] = np.clip(np.rint(pixels), 0, 255).astype(np.uint8)
-
-    # Add a bright boundary so small lesions remain visible.
+    #add a bright boundary so small lesions remain visible
     up = np.zeros_like(lesion)
     down = np.zeros_like(lesion)
     left = np.zeros_like(lesion)
     right = np.zeros_like(lesion)
-
     up[1:] = lesion[:-1]
     down[:-1] = lesion[1:]
     left[:, 1:] = lesion[:, :-1]
     right[:, :-1] = lesion[:, 1:]
-
     interior = lesion & up & down & left & right
     boundary = lesion & ~interior
-    rgb[boundary] = np.asarray([255, 220, 64], dtype=np.uint8)
-
+    rgb[boundary] = np.asarray(
+        [255, 220, 64] if colour == (255, 64, 32) else colour, dtype=np.uint8
+    )
     return rgb
-
 
 def _mask_slice(
     volume: np.ndarray,
@@ -372,7 +317,7 @@ def _mask_slice(
     *,
     axis: int,
 ) -> np.ndarray:
-    """Extract/orient a mask slice using the same plane as the image."""
+    #extract and orient the mask slice in the image plane
     return extract_display_slice(
         np.asarray(volume) > 0,
         axis=axis,
@@ -383,7 +328,6 @@ def _normalise_optional_path(text: str) -> str | None:
     value = str(text).strip()
     return value if value else None
 
-
 def _render_matching_panel(
     *,
     patient_id: str,
@@ -393,14 +337,13 @@ def _render_matching_panel(
     run_matching: bool,
     config: MatcherConfig,
 ) -> MatchImageFocus | None:
-    """Run or load matching outcomes scoped to the currently selected patient."""
+    #run or load matching results for the selected patient.
     st.divider()
     st.subheader("Lesion correspondence")
     st.caption(
         "Automatic BL ↔ FU outcomes for the patient shown in the aligned viewer. "
         "Results refresh whenever the patient selection changes."
     )
-
     matrix_path = matrix_dir / f"{patient_id}_cost_matrix.csv"
     if run_matching:
         try:
@@ -411,7 +354,6 @@ def _render_matching_panel(
             st.error(str(exc))
         except Exception as exc:
             st.error(f"Unexpected matching failure for patient '{patient_id}': {exc}")
-
     try:
         matches = load_patient_matches(results_path, patient_id)
     except FileNotFoundError as exc:
@@ -423,7 +365,6 @@ def _render_matching_panel(
     except MatchingDashboardError as exc:
         st.warning(str(exc))
         return None
-
     summary = summarise_patient_matches(matches, patient_id)
     counts = summary.outcome_counts
     metric_columns = st.columns(6)
@@ -434,7 +375,6 @@ def _render_matching_panel(
         ("MATCHED", "MERGING", "DISAPPEARING", "NEW"),
     ):
         column.metric(match_type.title(), counts.get(match_type, 0))
-
     preferred_columns = [
         "bl_lesion_id",
         "fu_lesion_id",
@@ -459,7 +399,7 @@ def _render_matching_panel(
         return f"{row['match_type']} · {bl_id} → {fu_id}"
 
     selected_index = st.selectbox(
-        "Inspect correspondence on aligned scans",
+        "Select BL lesion / correspondence (including appearing FU lesions)",
         options=list(range(len(matches))),
         format_func=_match_option_label,
         key=f"selected_match_{patient_id}",
@@ -470,10 +410,8 @@ def _render_matching_panel(
     except (FileNotFoundError, MatchingDashboardError) as exc:
         st.warning(f"Matching table is available, but image linking is unavailable: {exc}")
         return None
-
     st.caption(f"Spatial locations loaded from: {feature_path}")
     return focus
-
 
 def _centroid_marker_slice(
     shape: tuple[int, int, int],
@@ -482,7 +420,7 @@ def _centroid_marker_slice(
     axis: int,
     radius: int = 5,
 ) -> tuple[np.ndarray, int]:
-    """Create a displayed 2-D marker at a 3-D voxel centroid."""
+    #draw a 2-D marker at the lesion centroid
     point = np.asarray(centroid_voxel, dtype=float)
     if point.shape != (3,) or not np.all(np.isfinite(point)):
         raise ValueError(f"Invalid lesion voxel centroid: {centroid_voxel!r}")
@@ -490,19 +428,16 @@ def _centroid_marker_slice(
         raise ValueError(
             f"Lesion centroid {centroid_voxel!r} is outside image shape {shape}."
         )
-
     slice_index = int(np.clip(np.rint(point[axis]), 0, shape[axis] - 1))
     remaining_axes = [value for value in range(3) if value != axis]
     raw_shape = (shape[remaining_axes[0]], shape[remaining_axes[1]])
     raw_marker = np.zeros(raw_shape, dtype=bool)
     centre_row = int(np.clip(np.rint(point[remaining_axes[0]]), 0, raw_shape[0] - 1))
     centre_col = int(np.clip(np.rint(point[remaining_axes[1]]), 0, raw_shape[1] - 1))
-
     rows, columns = np.ogrid[: raw_shape[0], : raw_shape[1]]
     disk = (rows - centre_row) ** 2 + (columns - centre_col) ** 2 <= radius**2
     raw_marker[disk] = True
     return np.ascontiguousarray(np.flipud(np.rot90(raw_marker))), slice_index
-
 
 def _render_lesion_focus(
     focus: MatchImageFocus,
@@ -512,29 +447,28 @@ def _render_lesion_focus(
     fu_ct: LoadedVolume,
     modality: str,
     plane_name: str,
+    baseline_mask=None,
+    followup_mask=None,
 ) -> None:
-    """Show selected BL/FU lesions on their own centroid slices in FU space."""
+    #show each selected mask on a slice that contains the lesion
     st.divider()
     st.subheader("Selected correspondence on aligned scans")
-    st.caption(
-        f"{focus.match_type} · both panels use the common FU grid. The marker "
-        "shows the aligned lesion centroid; each side uses its own centroid slice."
-    )
+    status, colour = OUTCOME_STYLES.get(focus.match_type, (focus.match_type, (0, 220, 255)))
+    st.markdown(f"**{status}**")
+    st.caption("Cyan: automatic match · Amber: appearing · Pink: disappearing. "
+               "Both panels highlight the selected segmentation on its largest cross-section.")
     info = plane_info(fu_ct, plane_name)
     row_mm, col_mm = display_pixel_spacing_mm(fu_ct, plane_name)
 
-    def render_location(location, display, title: str) -> None:
+    def render_location(location, display, title: str, mask) -> None:
         if location is None:
             st.info(f"No {title} lesion for this {focus.match_type} outcome.")
             return
         try:
-            marker, slice_index = _centroid_marker_slice(
-                tuple(int(value) for value in display.shape),
-                location.centroid_voxel,
-                axis=info.voxel_axis,
-            )
+            selected = selected_lesion_mask(location, fu_ct, mask)
+            marker, slice_index = lesion_display_slice(selected, info.voxel_axis)
             image = _uint8_slice(display, slice_index, axis=info.voxel_axis)
-            image = _overlay_mask(image, marker, alpha=0.75)
+            image = _overlay_mask(image, marker, alpha=0.60, colour=colour)
             image = physical_aspect_resize(
                 image,
                 row_spacing_mm=row_mm,
@@ -543,7 +477,6 @@ def _render_lesion_focus(
         except Exception as exc:
             st.error(f"Could not locate {location.lesion_id} on the scan: {exc}")
             return
-
         st.markdown(f"**{title}: {location.lesion_id}**")
         st.image(
             image,
@@ -558,10 +491,9 @@ def _render_lesion_focus(
 
     bl_column, fu_column = st.columns(2)
     with bl_column:
-        render_location(focus.baseline, registered_display, f"Registered BL {modality}")
+        render_location(focus.baseline, registered_display, f"Registered BL {modality}", baseline_mask)
     with fu_column:
-        render_location(focus.followup, fu_display, f"FU {modality}")
-
+        render_location(focus.followup, fu_display, f"FU {modality}", followup_mask)
 
 def _registration_paths(
     output_root: str | Path,
@@ -572,14 +504,12 @@ def _registration_paths(
     registered_mask_path = output_dir / "registered_baseline_lesion_mask.nii.gz"
     return output_dir, registered_path, registered_mask_path
 
-
 def _registration_is_ready(output_dir: Path, registered_path: Path) -> bool:
-    """Rigid-only output files required by the current stable pipeline."""
+    #return the rigid-registration output paths used by the pipeline
     return (
         registered_path.exists()
         and (output_dir / "TransformParameters.0.txt").exists()
     )
-
 
 def _window_values(name: str) -> tuple[float, float]:
     presets = {
@@ -589,7 +519,6 @@ def _window_values(name: str) -> tuple[float, float]:
         "Wide": (-1000.0, 2000.0),
     }
     return presets[name]
-
 
 def _geometry_matches(a: LoadedVolume, b: LoadedVolume) -> bool:
     return (
@@ -602,26 +531,19 @@ def _geometry_matches(a: LoadedVolume, b: LoadedVolume) -> bool:
         )
     )
 
-
 def _prepare_display_volume(
     data: np.ndarray,
     *,
     low_hu: float,
     high_hu: float,
 ) -> np.ndarray:
-    """
-    Window a whole CT volume once and convert it to uint8.
-
-    This is intentionally done outside the slice fragment so moving the slider
-    only selects/rotates a uint8 slice instead of repeating HU clipping and
-    normalisation on every interaction.
-    """
+    #window CT data once as uint8 so slider changes only extract and rotate slices
     if data.ndim != 3:
         raise ValueError(f"Expected a 3-D CT volume, got {data.shape}.")
     if high_hu <= low_hu:
         raise ValueError("CT window upper bound must be greater than lower bound.")
 
-    # Work in float32 to reduce temporary memory compared with float64.
+    #work in float32 to reduce temporary memory compared with float64
     image = np.asarray(data, dtype=np.float32).copy()
     np.nan_to_num(
         image,
@@ -631,35 +553,28 @@ def _prepare_display_volume(
         neginf=low_hu,
     )
     np.clip(image, low_hu, high_hu, out=image)
-
     image -= low_hu
     image *= 255.0 / (high_hu - low_hu)
-
     return np.rint(image).astype(np.uint8)
 
-
 def _prepare_pet_display_volume(data: np.ndarray) -> tuple[np.ndarray, float, float]:
-    """Percentile-normalise a PET volume once for responsive slice viewing."""
+    #normalise PET intensities by percentile once for slice viewing
     if data.ndim != 3:
         raise ValueError(f"Expected a 3-D PET volume, got {data.shape}.")
-
     image = np.asarray(data, dtype=np.float32).copy()
     finite = image[np.isfinite(image)]
     if finite.size == 0:
         raise ValueError("PET volume contains no finite intensity values.")
-
     low, high = np.percentile(finite, (1.0, 99.5))
     low = float(low)
     high = float(high)
     if high <= low:
         high = low + 1.0
-
     np.nan_to_num(image, copy=False, nan=low, posinf=high, neginf=low)
     np.clip(image, low, high, out=image)
     image -= low
     image *= 255.0 / (high - low)
     return np.rint(image).astype(np.uint8), low, high
-
 
 def _get_pet_display_volumes(
     *,
@@ -680,7 +595,6 @@ def _get_pet_display_volumes(
         str(followup_pet.metadata.path),
         _file_modified_ns(followup_pet.metadata.path),
     )
-
     cache = st.session_state.get("_alignment_display_cache")
     if cache is None or cache.get("signature") != signature:
         with st.spinner("Preparing PET display volumes..."):
@@ -693,10 +607,7 @@ def _get_pet_display_volumes(
             fu_display, fu_low, fu_high = _prepare_pet_display_volume(
                 followup_pet.data
             )
-
-        # A shared caption range is informative only; each PET panel is
-        # normalised independently so a very hot lesion in one timepoint does
-        # not make the other panel nearly black.
+        #normalise PET panels separately to preserve contrast; the shared caption range is only a reference
         st.session_state["_alignment_display_cache"] = {
             "signature": signature,
             "original": original_display,
@@ -706,7 +617,6 @@ def _get_pet_display_volumes(
             "high_hu": max(original_high, registered_high, fu_high),
         }
         cache = st.session_state["_alignment_display_cache"]
-
     return (
         cache["original"],
         cache["registered"],
@@ -715,13 +625,11 @@ def _get_pet_display_volumes(
         float(cache["high_hu"]),
     )
 
-
 def _file_modified_ns(path: Path) -> int | None:
     try:
         return path.stat().st_mtime_ns
     except OSError:
         return None
-
 
 def _display_cache_signature(
     patient_id: str,
@@ -731,12 +639,7 @@ def _display_cache_signature(
     fu_ct: LoadedVolume,
     window_name: str,
 ) -> tuple[object, ...]:
-    """
-    Build a signature for the single in-session display-volume cache.
-
-    Only the current patient/window is retained, so switching among several
-    patients does not accumulate multiple full CT display volumes in memory.
-    """
+    #identify cached display volumes; keep only the current patient and window to limit memory use
     return (
         str(patient_id),
         str(registered_path.resolve()),
@@ -748,7 +651,6 @@ def _display_cache_signature(
         str(window_name),
     )
 
-
 def _get_display_volumes(
     *,
     patient_id: str,
@@ -759,14 +661,8 @@ def _get_display_volumes(
     fu_ct: LoadedVolume,
     window_name: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
-    """
-    Return windowed uint8 Original-BL / Registered-BL / FU volumes.
-
-    These are prepared once per patient/window and kept in session state.
-    Slider movement therefore only extracts three already-windowed slices.
-    """
+    #cache windowed uint8 BL, registered BL and FU volumes per patient and window for slice selection
     low_hu, high_hu = _window_values(window_name)
-
     signature = _display_cache_signature(
         patient_id,
         registered_path,
@@ -804,7 +700,6 @@ def _get_display_volumes(
             "high_hu": high_hu,
         }
         cache = st.session_state["_alignment_display_cache"]
-
     return (
         cache["original"],
         cache["registered"],
@@ -819,23 +714,18 @@ def _uint8_slice(
     *,
     axis: int,
 ) -> np.ndarray:
-    """Extract one already-normalised slice in the selected anatomical plane."""
+    #extract a normalised slice in the selected anatomical plane
     return extract_display_slice(volume, axis=axis, index=index)
 
-
 def _ras_to_lps(point_xyz: np.ndarray) -> np.ndarray:
-    """
-    Convert nibabel/NIfTI RAS world coordinates to ITK/Elastix LPS coordinates.
-    """
+    #convert NIfTI RAS coordinates to ITK/Elastix LPS coordinates
     point = np.asarray(point_xyz, dtype=float)
     return np.asarray([-point[0], -point[1], point[2]], dtype=float)
-
 
 def _lps_to_ras(point_xyz: np.ndarray) -> np.ndarray:
-    """Convert ITK/Elastix LPS world coordinates back to nibabel RAS."""
+    #convert ITK/Elastix LPS coordinates to NIfTI RAS coordinates
     point = np.asarray(point_xyz, dtype=float)
     return np.asarray([-point[0], -point[1], point[2]], dtype=float)
-
 
 def _parameter_value(
     parameter_map,
@@ -851,37 +741,19 @@ def _parameter_value(
         raise ValueError(
             f"Rigid transform parameter '{name}' is missing."
         )
-
     return tuple(str(value) for value in values)
 
-
 def _build_elastix_euler_transform(transform_path: str):
-    """
-    Reconstruct the saved Elastix 3-D Euler rigid transform.
-
-    Important direction convention
-    ------------------------------
-    Elastix image-registration transforms map points from the FIXED image
-    domain to the MOVING image domain. In this project:
-
-        fixed  = FU
-        moving = Original BL
-
-    Therefore this transform can directly map a FU physical point to its
-    corresponding location in Original BL space. No numerical inversion is
-    required for this viewer.
-    """
+    #rebuild the Elastix Euler transform from fixed FU to moving native BL, no inversion is needed
     try:
         import itk
     except ImportError as exc:
         raise RuntimeError(
             "ITKElastix is required to map FU positions back to Original BL."
         ) from exc
-
     parameter_object = itk.ParameterObject.New()
     parameter_object.AddParameterFile(str(transform_path))
     parameter_map = parameter_object.GetParameterMap(0)
-
     transform_name = _parameter_value(
         parameter_map,
         "Transform",
@@ -892,13 +764,11 @@ def _build_elastix_euler_transform(transform_path: str):
             "Original-BL slice mapping currently supports only the rigid "
             f"EulerTransform, but the saved transform is {transform_name!r}."
         )
-
     initial = _parameter_value(
         parameter_map,
         "InitialTransformParameterFileName",
         default=("NoInitialTransform",),
     )[0].strip('"')
-
     if initial not in {
         "NoInitialTransform",
         "NoInitialTransformParameterFileName",
@@ -908,7 +778,6 @@ def _build_elastix_euler_transform(transform_path: str):
             "transform. This viewer intentionally refuses to ignore a transform "
             f"chain: {initial}"
         )
-
     parameters = tuple(
         float(value)
         for value in _parameter_value(
@@ -916,14 +785,12 @@ def _build_elastix_euler_transform(transform_path: str):
             "TransformParameters",
         )
     )
-
     if len(parameters) != 6:
         raise ValueError(
             "Expected six Euler rigid parameters "
             "(rx, ry, rz, tx, ty, tz); "
             f"found {len(parameters)}."
         )
-
     centre = tuple(
         float(value)
         for value in _parameter_value(
@@ -931,19 +798,16 @@ def _build_elastix_euler_transform(transform_path: str):
             "CenterOfRotationPoint",
         )
     )
-
     if len(centre) != 3:
         raise ValueError(
             "Expected a 3-D CenterOfRotationPoint in the rigid transform."
         )
-
     compute_zyx_text = _parameter_value(
         parameter_map,
         "ComputeZYX",
         default=("false",),
     )[0].strip('"').lower()
     compute_zyx = compute_zyx_text == "true"
-
     rigid = itk.Euler3DTransform[itk.D].New()
     rigid.SetCenter(centre)
     rigid.SetComputeZYX(compute_zyx)
@@ -959,9 +823,7 @@ def _build_elastix_euler_transform(transform_path: str):
             parameters[5],
         )
     )
-
     return rigid
-
 
 @st.cache_data(show_spinner=False)
 def _fu_to_bl_slice_map(
@@ -976,45 +838,31 @@ def _fu_to_bl_slice_map(
     transform_path: str,
     transform_modified_ns: int,
 ) -> tuple[float, ...]:
-    """
-    Map each FU anatomical-plane centre into the matching native BL plane axis.
-
-    Registered BL and FU already share FU geometry, so their slice index is
-    exactly shared. Original BL remains native; for that reference panel we map
-    the centre point of the selected FU plane through the saved rigid transform
-    and choose the nearest native BL plane of the same anatomical orientation.
-    """
-    del transform_modified_ns  # cache invalidation only
-
+    #map each FU plane centre to the nearest native BL plane of the same orientation
+    #registered BL and FU share the FU grid and slice index
+    del transform_modified_ns  #cache invalidation only
     bl_affine = np.asarray(bl_affine_flat, dtype=float).reshape(4, 4)
     fu_affine = np.asarray(fu_affine_flat, dtype=float).reshape(4, 4)
     bl_axis = anatomical_axis(bl_orientation, plane_name)
     fu_axis = anatomical_axis(fu_orientation, plane_name)
-
     try:
         bl_affine_inv = np.linalg.inv(bl_affine)
     except np.linalg.LinAlgError as exc:
         raise ValueError("Original BL affine is not invertible.") from exc
-
     rigid = _build_elastix_euler_transform(transform_path)
     mapped_axis: list[float] = []
-
     centre = np.asarray([(size - 1) / 2.0 for size in fu_shape] + [1.0], dtype=float)
-
     for slice_index in range(fu_shape[fu_axis]):
         fu_voxel = centre.copy()
         fu_voxel[fu_axis] = float(slice_index)
-
-        # nibabel gives RAS physical coordinates.
+        #nibabel gives RAS physical coordinates
         fu_world_ras = (fu_affine @ fu_voxel)[:3]
         fu_world_lps = _ras_to_lps(fu_world_ras)
-
-        # Elastix transform direction is fixed(FU) -> moving(BL).
+        #Elastix transform direction is fixed(FU) -> moving(BL)
         bl_world_lps = np.asarray(
             rigid.TransformPoint(tuple(float(v) for v in fu_world_lps)),
             dtype=float,
         )
-
         bl_world_ras = _lps_to_ras(bl_world_lps)
         bl_world_h = np.asarray(
             [bl_world_ras[0], bl_world_ras[1], bl_world_ras[2], 1.0],
@@ -1022,9 +870,7 @@ def _fu_to_bl_slice_map(
         )
         bl_voxel = bl_affine_inv @ bl_world_h
         mapped_axis.append(float(bl_voxel[bl_axis]))
-
     return tuple(mapped_axis)
-
 
 def _mapped_native_bl_slice(
     mapped_z_by_fu_slice: tuple[float, ...],
@@ -1032,25 +878,17 @@ def _mapped_native_bl_slice(
     fu_slice_index: int,
     bl_slice_count: int,
 ) -> tuple[int, float, bool]:
-    """
-    Return the nearest Original-BL native axial slice for a FU slice.
-
-    The continuous z coordinate comes from the saved ITKElastix rigid
-    registration transform, not from raw-coordinate proximity.
-    """
+    #find the nearest native BL axial slice using the saved transform, not raw-coordinate proximity
     if not 0 <= fu_slice_index < len(mapped_z_by_fu_slice):
         raise IndexError(
             f"FU slice {fu_slice_index} is outside the precomputed mapping."
         )
-
     continuous_index = float(mapped_z_by_fu_slice[fu_slice_index])
     last_index = bl_slice_count - 1
-
     outside_fov = (
         continuous_index < -0.5
         or continuous_index > last_index + 0.5
     )
-
     index = int(
         np.clip(
             np.rint(continuous_index),
@@ -1058,9 +896,7 @@ def _mapped_native_bl_slice(
             last_index,
         )
     )
-
     return index, continuous_index, outside_fov
-
 
 @st.fragment
 def _render_slice_viewer(
@@ -1081,11 +917,10 @@ def _render_slice_viewer(
     registered_bl_mask: LoadedVolume | None,
     fu_mask: LoadedVolume | None,
 ) -> None:
-    """Three-column Original BL / Registered BL / FU multiplanar viewer."""
+    #show original BL, registered BL and FU in three columns
     modality_name = str(modality).upper()
     fu_info = plane_info(fu_ct, plane_name)
     bl_info = plane_info(bl_ct, plane_name)
-
     st.divider()
     st.subheader("Multiplanar alignment comparison")
     st.caption(
@@ -1094,14 +929,12 @@ def _render_slice_viewer(
         "BL and FU = the exact same FU-space anatomical plane. "
         + ("Lesion masks are ON." if show_masks else "Lesion masks are OFF.")
     )
-
     slice_count = fu_info.slice_count
     state_key = f"slice_{patient_id}_{plane_name.lower()}"
     if state_key not in st.session_state:
         st.session_state[state_key] = slice_count // 2
     elif not 0 <= int(st.session_state[state_key]) < slice_count:
         st.session_state[state_key] = slice_count // 2
-
     slice_index = st.slider(
         f"FU-space {plane_name.lower()} slice",
         min_value=0,
@@ -1109,7 +942,6 @@ def _render_slice_viewer(
         step=1,
         key=state_key,
     )
-
     world_xyz = slice_centre_world_mm(
         fu_ct,
         plane=plane_name,
@@ -1120,7 +952,6 @@ def _render_slice_viewer(
         fu_slice_index=slice_index,
         bl_slice_count=bl_info.slice_count,
     )
-
     try:
         original_slice = _uint8_slice(
             original_display,
@@ -1137,11 +968,9 @@ def _render_slice_viewer(
             slice_index,
             axis=fu_info.voxel_axis,
         )
-
         original_mask_slice = None
         registered_mask_slice = None
         fu_mask_slice = None
-
         if show_masks:
             if bl_mask is not None:
                 original_mask_slice = _mask_slice(
@@ -1161,16 +990,10 @@ def _render_slice_viewer(
                     slice_index,
                     axis=fu_info.voxel_axis,
                 )
-
         original_slice = _overlay_mask(original_slice, original_mask_slice)
         registered_slice = _overlay_mask(registered_slice, registered_mask_slice)
         fu_slice = _overlay_mask(fu_slice, fu_mask_slice)
-
-        # Streamlit preserves raw pixel aspect ratio, but medical-image voxels
-        # are often anisotropic.  Correct display sampling using each grid's
-        # physical spacing so coronal/sagittal anatomy is not visually
-        # stretched.  Original BL keeps native-BL spacing; Registered BL and
-        # FU both use the shared FU/reference grid spacing.
+        #preserve image proportions with native BL spacing for original BL and FU spacing for both aligned panels
         bl_row_mm, bl_col_mm = display_pixel_spacing_mm(bl_ct, plane_name)
         fu_row_mm, fu_col_mm = display_pixel_spacing_mm(fu_ct, plane_name)
         original_slice = physical_aspect_resize(
@@ -1191,30 +1014,25 @@ def _render_slice_viewer(
     except Exception as exc:
         st.error(f"Could not render current {plane_name.lower()} slices: {exc}")
         return
-
     if modality_name == "CT":
         intensity_text = f"window [{display_low:.0f}, {display_high:.0f}] HU"
     else:
         intensity_text = (
             f"PET display percentile range ≈ [{display_low:.3g}, {display_high:.3g}]"
         )
-
     st.caption(
         f"FU-space {plane_name.lower()} slice {slice_index + 1}/{slice_count} · "
         f"world centre ≈ ({world_xyz[0]:.1f}, {world_xyz[1]:.1f}, "
         f"{world_xyz[2]:.1f}) mm · {intensity_text} · "
         "display aspect = physical voxel spacing"
     )
-
     if outside_fov:
         st.warning(
             f"The rigid-mapped FU position falls outside the native BL "
             f"{plane_name.lower()} range. The Original BL panel is showing "
             f"the nearest edge slice ({original_index})."
         )
-
     before, after, reference = st.columns(3)
-
     with before:
         st.markdown(f"**Original BL {modality_name}**")
         st.image(
@@ -1225,7 +1043,6 @@ def _render_slice_viewer(
             ),
             use_container_width=True,
         )
-
     with after:
         st.markdown(f"**Registered BL {modality_name}**")
         st.image(
@@ -1236,7 +1053,6 @@ def _render_slice_viewer(
             ),
             use_container_width=True,
         )
-
     with reference:
         st.markdown(f"**FU {modality_name}**")
         st.image(
@@ -1247,25 +1063,21 @@ def _render_slice_viewer(
             use_container_width=True,
         )
 
-
 def main() -> None:
     st.set_page_config(
         page_title="Longitudinal Multiplanar Viewer",
         page_icon="🩻",
         layout="wide",
     )
-
     st.title("Longitudinal BL → FU Multiplanar Viewer")
     st.caption(f"**{APP_VERSION}**")
     st.caption(
         "ITKElastix rigid-only registration with linked Axial / Coronal / "
         "Sagittal CT/PET viewing in FU space."
     )
-
     with st.sidebar:
         st.caption(APP_VERSION)
         st.header("Data")
-
         manifest_text = st.text_input(
             "Pair manifest",
             value=DEFAULT_PAIRS,
@@ -1287,26 +1099,21 @@ def main() -> None:
             "Registration output root",
             value=DEFAULT_OUTPUT_ROOT,
         )
-
     manifest_path = Path(manifest_text).expanduser()
     if not manifest_path.exists():
         st.error(f"Pair manifest not found: {manifest_path}")
         st.stop()
-
     try:
         manifest_modified_ns = manifest_path.stat().st_mtime_ns
         patient_ids = _patient_ids(str(manifest_path), manifest_modified_ns)
     except Exception as exc:
         st.error(f"Could not read pair manifest: {exc}")
         st.stop()
-
     if not patient_ids:
         st.warning("No patient IDs were found in the pair manifest.")
         st.stop()
-
     with st.sidebar:
         patient_id = st.selectbox("Patient", options=patient_ids)
-
         st.header("Alignment")
         st.write("Conservative baseline: **Rigid only**")
         run_alignment = st.button(
@@ -1314,7 +1121,6 @@ def main() -> None:
             type="primary",
             use_container_width=True,
         )
-
         st.header("Viewer")
         display_modality = st.selectbox(
             "Modality",
@@ -1334,7 +1140,6 @@ def main() -> None:
                 "Sagittal = side-to-side slices."
             ),
         )
-
         if display_modality == "CT":
             window_name = st.selectbox(
                 "CT window",
@@ -1344,7 +1149,6 @@ def main() -> None:
         else:
             window_name = "Soft tissue"  # unused in PET mode
             st.caption("PET display uses robust percentile normalisation.")
-
         show_masks = st.checkbox(
             "Show lesion masks",
             value=False,
@@ -1354,7 +1158,6 @@ def main() -> None:
                 "interpolation."
             ),
         )
-
         st.header("Lesion matching")
         match_results_text = st.text_input(
             "Matching results CSV",
@@ -1398,7 +1201,6 @@ def main() -> None:
             use_container_width=True,
             help="Runs NetworkX min-cost-flow for the selected patient only.",
         )
-
     data_root = _normalise_optional_path(data_root_text)
     output_root = Path(output_root_text).expanduser()
     output_dir, registered_path, registered_mask_path = _registration_paths(
@@ -1406,7 +1208,6 @@ def main() -> None:
         patient_id,
     )
     registered_pet_path = output_dir / "registered_baseline_pet.nii.gz"
-
     try:
         pair = _load_pair_cached(
             str(manifest_path),
@@ -1418,20 +1219,16 @@ def main() -> None:
     except Exception as exc:
         st.error(f"Could not load patient '{patient_id}': {exc}")
         st.stop()
-
     if pair.baseline.ct is None or pair.followup.ct is None:
         st.error("This patient does not have both baseline and follow-up CT loaded.")
         st.stop()
-
     bl_ct = pair.baseline.ct
     fu_ct = pair.followup.ct
-
     top1, top2, top3, top4 = st.columns(4)
     top1.metric("Patient", patient_id)
     top2.metric("View", plane_name)
     top3.metric("BL CT shape", " × ".join(map(str, bl_ct.data.shape)))
     top4.metric("FU CT shape", " × ".join(map(str, fu_ct.data.shape)))
-
     match_image_focus = _render_matching_panel(
         patient_id=patient_id,
         results_path=Path(match_results_text).expanduser(),
@@ -1445,7 +1242,6 @@ def main() -> None:
             max_bl_per_fu=int(max_bl_per_fu),
         ),
     )
-
     if run_alignment:
         try:
             with st.spinner(f"Registering {patient_id}: rigid only..."):
@@ -1459,7 +1255,6 @@ def main() -> None:
                     log_to_console=False,
                     overwrite=True,
                 )
-
             _load_registered_ct_cached.clear()
             _load_registered_mask_cached.clear()
             _load_registered_pet_cached.clear()
@@ -1469,7 +1264,6 @@ def main() -> None:
             st.error(str(exc))
         except Exception as exc:
             st.error(f"Unexpected registration failure: {exc}")
-
     ready = _registration_is_ready(output_dir, registered_path)
     if not ready:
         st.info(
@@ -1479,7 +1273,6 @@ def main() -> None:
         st.write("BL CT:", bl_ct.metadata.path)
         st.write("FU CT:", fu_ct.metadata.path)
         st.stop()
-
     try:
         registered_modified_ns = registered_path.stat().st_mtime_ns
         registered_bl = _load_registered_ct_cached(
@@ -1489,7 +1282,6 @@ def main() -> None:
     except Exception as exc:
         st.error(f"Could not load registered baseline CT: {exc}")
         st.stop()
-
     if not _geometry_matches(registered_bl, fu_ct):
         st.error(
             "Registered BL CT and FU CT do not share the same shape/affine. "
@@ -1497,10 +1289,8 @@ def main() -> None:
             "would not represent the same physical space."
         )
         st.stop()
-
     transform_path = output_dir / "TransformParameters.0.txt"
-
-    # Build the native-BL mapping for the currently selected anatomical plane.
+    #build the native-BL mapping for the currently selected anatomical plane
     try:
         mapped_axis_by_fu_slice = _fu_to_bl_slice_map(
             bl_shape=tuple(int(v) for v in bl_ct.data.shape),
@@ -1525,24 +1315,20 @@ def main() -> None:
             f"from the saved rigid transform: {exc}"
         )
         st.stop()
-
     bl_mask = pair.baseline.lesion_mask
     fu_mask = pair.followup.lesion_mask
     registered_bl_mask = None
-
-    if show_masks:
+    if show_masks or match_image_focus is not None:
         if bl_mask is None or fu_mask is None:
             st.warning(
                 "Lesion-mask overlay requested, but this patient does not have "
                 "both BL and FU lesion masks. Available masks will still be shown."
             )
-
         try:
             if bl_mask is not None:
                 _validate_image_mask_geometry(bl_ct, bl_mask, label="Baseline")
             if fu_mask is not None:
                 _validate_image_mask_geometry(fu_ct, fu_mask, label="Follow-up")
-
             if bl_mask is not None:
                 with st.spinner("Preparing rigidly transformed BL lesion mask..."):
                     _warp_baseline_mask_to_fu(
@@ -1550,7 +1336,6 @@ def main() -> None:
                         transform_path=transform_path,
                         registered_mask_path=registered_mask_path,
                     )
-
                 registered_bl_mask = _load_registered_mask_cached(
                     str(registered_mask_path),
                     registered_mask_path.stat().st_mtime_ns,
@@ -1563,8 +1348,7 @@ def main() -> None:
         except Exception as exc:
             st.error(f"Could not prepare lesion-mask overlay: {exc}")
             st.stop()
-
-    # Prepare the selected image modality on CT-defined BL/FU grids.
+    #prepare the selected image modality on CT-defined BL/FU grids
     if display_modality == "CT":
         try:
             (
@@ -1597,8 +1381,7 @@ def main() -> None:
 
         try:
             with st.spinner("Preparing PET on CT-aligned grids..."):
-                # Within each timepoint PET/CT are assumed to be physically
-                # co-registered. Resampling only puts PET onto the CT voxel grid.
+                #assume PET and CT are already co-registered; resampling only changes the voxel grid
                 original_bl_pet = resample_to_reference(
                     bl_pet,
                     bl_ct,
@@ -1621,7 +1404,6 @@ def main() -> None:
                     str(registered_pet_path),
                     registered_pet_path.stat().st_mtime_ns,
                 )
-
             if not _geometry_matches(registered_bl_pet, fu_ct):
                 st.error(
                     "Registered BL PET does not share the FU CT output grid. "
@@ -1656,7 +1438,6 @@ def main() -> None:
         except Exception as exc:
             st.error(f"Could not prepare PET display volumes: {exc}")
             st.stop()
-
     _render_slice_viewer(
         original_display,
         registered_display,
@@ -1674,17 +1455,17 @@ def main() -> None:
         registered_bl_mask=registered_bl_mask,
         fu_mask=fu_mask,
     )
-
     if match_image_focus is not None:
         _render_lesion_focus(
             match_image_focus,
-            registered_display=registered_display,
-            fu_display=fu_display,
+            registered_display=_prepare_display_volume(registered_bl.data, low_hu=-160, high_hu=240),
+            fu_display=_prepare_display_volume(fu_ct.data, low_hu=-160, high_hu=240),
             fu_ct=fu_ct,
-            modality=display_modality,
+            modality="CT",
             plane_name=plane_name,
+            baseline_mask=registered_bl_mask,
+            followup_mask=fu_mask,
         )
-
     with st.expander("Registration / viewer details"):
         st.write("BL CT source:", str(bl_ct.metadata.path))
         st.write("FU CT source:", str(fu_ct.metadata.path))
@@ -1708,7 +1489,6 @@ def main() -> None:
         st.write("BL orientation:", bl_ct.metadata.orientation)
         st.write("FU orientation:", fu_ct.metadata.orientation)
         st.write("FU spacing (mm):", fu_ct.metadata.spacing_mm)
-
 
 if __name__ == "__main__":
     main()
