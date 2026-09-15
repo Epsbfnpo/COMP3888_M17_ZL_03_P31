@@ -8,6 +8,7 @@ import nibabel as nib
 from nibabel.processing import resample_from_to
 import numpy as np
 from scipy import ndimage as ndi
+from PIL import Image
 
 from .cohort_a_loading import LoadedVolume, VolumeMetadata, load_nifti_volume
 
@@ -94,7 +95,19 @@ def extract_display_slice(
             f"for axis {axis}."
         )
 
-    raw_slice = np.take(data, int(index), axis=axis)
+    # IMPORTANT PERFORMANCE NOTE:
+    #
+    # NIfTI arrays returned by NiBabel are commonly Fortran-contiguous.
+    # ``np.take(..., axis=...)`` on a large F-order 3-D array can copy/gather
+    # through the whole volume and take seconds for a *single* slice.  Direct
+    # basic indexing creates a cheap 2-D view first; we only copy that slice
+    # when converting the rotated/flipped result to a contiguous display array.
+    if axis == 0:
+        raw_slice = data[int(index), :, :]
+    elif axis == 1:
+        raw_slice = data[:, int(index), :]
+    else:
+        raw_slice = data[:, :, int(index)]
     return np.ascontiguousarray(np.flipud(np.rot90(raw_slice)))
 
 
@@ -131,8 +144,12 @@ def physical_aspect_resize(
     row_spacing_mm: float,
     column_spacing_mm: float,
     max_side: int = 900,
+    allow_upscale: bool = True,
 ) -> np.ndarray:
-    #Resample a 2-D display image to preserve its physical millimetre aspect.
+    # Resample a 2-D display image so screen pixels preserve the physical
+    # millimetre aspect of the source slice.  The dashboard uses
+    # ``allow_upscale=False`` so interactive slider changes never inflate a
+    # 200-500 px medical slice to a 900 px intermediate image.
     arr = np.asarray(image)
     if arr.ndim not in (2, 3):
         raise MultiplanarViewError(
@@ -165,23 +182,53 @@ def physical_aspect_resize(
     physical_w = w * col_mm
     ratio = physical_h / physical_w
 
-    if ratio >= 1.0:
-        target_h = int(max_side)
-        target_w = max(1, int(round(target_h / ratio)))
+    if allow_upscale:
+        # Historical behaviour used by callers/tests that explicitly want a
+        # fixed render resolution.
+        if ratio >= 1.0:
+            target_h = int(max_side)
+            target_w = max(1, int(round(target_h / ratio)))
+        else:
+            target_w = int(max_side)
+            target_h = max(1, int(round(target_w * ratio)))
     else:
-        target_w = int(max_side)
-        target_h = max(1, int(round(target_w * ratio)))
+        # Keep the corrected image inside the original pixel bounding box.
+        # This preserves physical aspect while avoiding expensive upscaling on
+        # every Streamlit slider event.
+        raw_ratio = h / w
+        if raw_ratio > ratio:
+            target_w = w
+            target_h = max(1, int(round(target_w * ratio)))
+        else:
+            target_h = h
+            target_w = max(1, int(round(target_h / ratio)))
 
+        longest = max(target_h, target_w)
+        if longest > int(max_side):
+            scale = float(max_side) / float(longest)
+            target_h = max(1, int(round(target_h * scale)))
+            target_w = max(1, int(round(target_w * scale)))
+
+    if target_h == h and target_w == w:
+        return np.ascontiguousarray(arr)
+
+    # The interactive viewer feeds uint8 grayscale/RGB/RGBA slices here.
+    # Pillow performs bilinear resize in compiled code and is substantially
+    # faster than scipy.ndimage.zoom for this display-only operation.
+    if arr.dtype == np.uint8:
+        resized = np.asarray(
+            Image.fromarray(arr).resize(
+                (int(target_w), int(target_h)),
+                resample=Image.Resampling.BILINEAR,
+            )
+        )
+        return np.ascontiguousarray(resized)
+
+    # Retain a generic fallback for non-uint8 callers.
     zoom_h = target_h / h
     zoom_w = target_w / w
     zoom = (zoom_h, zoom_w) if arr.ndim == 2 else (zoom_h, zoom_w, 1.0)
-
     resized = ndi.zoom(arr, zoom, order=1, mode="nearest", prefilter=False)
-
-    #ndimage normally preserves dtype, but clamp/cast explicitly for the
-    #uint8 RGB arrays used by the dashboard.
-    if arr.dtype == np.uint8 and resized.dtype != np.uint8:
-        resized = np.clip(np.rint(resized), 0, 255).astype(np.uint8)
     return np.ascontiguousarray(resized)
 
 
