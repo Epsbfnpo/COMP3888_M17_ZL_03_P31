@@ -255,3 +255,64 @@ python -m pytest -q tests/test_multiplanar_view.py
 ```
 
 Then smoke-test the real Streamlit dashboard on at least one registered Cohort B patient by switching all three planes, CT/PET, and lesion-mask overlay.
+
+## Interactive slider performance
+
+The multiplanar slider uses a Streamlit fragment, so changing the slice index reruns only the viewer fragment rather than the complete matching/evaluation dashboard. CT/PET volumes and registration outputs remain cached.
+
+For interactive rendering, physical-aspect correction now uses Pillow's compiled bilinear resize and does **not** upscale native medical-image slices before sending them to the browser. The longest rendered side is capped at 560 pixels by default, which is sufficient for the three-column dashboard and avoids repeatedly creating 900-pixel intermediate images. This changes display rendering only; NIfTI data, registration geometry, masks, lesion coordinates, matching and evaluation outputs are unchanged.
+
+For a larger screenshot render, set `P31_VIEWER_MAX_SIDE` before starting Streamlit, for example `$env:P31_VIEWER_MAX_SIDE = "900"`. The interactive default remains 560 for responsiveness.
+
+## Interactive slider performance (V4.6)
+
+The multiplanar slider runs inside a Streamlit fragment, so moving the slice control does not need to recompute the tracking pipeline. V4.6 additionally caches **display-only JPEG panels** for already viewed slices and pre-renders a bounded neighbourhood around a cache miss (default: disabled (0 slices)). This is designed for presentation/demo use and does not alter NIfTI volumes, masks, registration transforms, lesion features, costs, or matching results.
+
+The viewer cache is session-local and bounded. It is cleared after a new registration. Physical voxel aspect correction is still applied before a panel is encoded, so the performance optimisation does not reintroduce the stretched coronal/sagittal display problem.
+
+Launcher controls:
+
+```powershell
+# Normal demo: cache nearby slices automatically
+.\run_demo.ps1 -Cohort A -Patients 2 -Mode dashboard
+
+# Print fragment/cache timing lines in the terminal for diagnosis
+.\run_demo.ps1 -Cohort A -Patients 2 -Mode dashboard -ViewerTiming
+
+# Change the prefetch neighbourhood if required (0 disables prefetch)
+.\run_demo.ps1 -Cohort A -Patients 2 -Mode dashboard -ViewerPrefetchRadius 10
+```
+
+With `-ViewerTiming`, terminal lines such as the following are expected:
+
+```text
+[P31 viewer] ... slice=138 cache=HIT current_render=0.0ms ... fragment_python=...
+```
+
+A cache hit confirms that slice extraction, mask overlay, physical-aspect correction, and image encoding were reused. There is still a small browser/server round-trip because Streamlit widgets are server-driven. A fully client-side radiology-style scroll viewer would require a custom JavaScript component (or a specialised web viewer such as OHIF/Cornerstone), not Java.
+
+### Streamlit console messages
+
+V4.6 also removes two sources of noisy console output:
+
+- deprecated `use_container_width=True` calls were replaced with the current `width="stretch"` API;
+- the mixed-type cost-detail `Value` column is converted to display strings before `st.dataframe`, avoiding PyArrow's automatic fallback for values such as `np.bool_` mixed with floats/strings.
+
+The previous PyArrow traceback was recoverable and did not corrupt results, but it added unnecessary work on full dashboard reruns and made performance diagnosis harder.
+
+
+## V4.7 slider performance fix: Fortran-order NIfTI slicing
+
+Cohort A exposed a second performance issue that was not visible with smaller Cohort B studies.
+NiBabel/NIfTI arrays are often **Fortran-contiguous**.  The earlier viewer used `np.take` to extract a
+2-D slice from a 3-D volume.  On a large Fortran-order array, `np.take(..., axis=...)` can be orders
+of magnitude slower than direct NumPy indexing and may take seconds for one mask slice.
+
+V4.7 now uses basic indexing (`data[:, :, z]`, `data[:, y, :]`, or `data[x, :, :]`) to obtain a cheap
+2-D view first, then rotates/flips and copies only that 2-D slice for display.  This applies to CT/PET
+and lesion masks without changing image values, geometry, registration, matching, or evaluation.
+
+Synchronous neighbour prefetch is now **disabled by default** (`P31_VIEWER_PREFETCH_RADIUS=0`).
+Large jumps therefore render only the requested slice instead of blocking while 20 neighbouring
+slices are also generated.  The existing JPEG cache is retained, so revisiting a slice is still an
+immediate cache hit.  Prefetch remains opt-in for experiments via `-ViewerPrefetchRadius N`.

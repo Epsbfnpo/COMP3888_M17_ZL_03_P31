@@ -67,6 +67,24 @@ def test_extract_display_slice_uses_selected_axis():
     assert axial.shape == (5, 4)
 
 
+
+
+def test_extract_display_slice_handles_fortran_order_without_np_take(monkeypatch):
+    # NiBabel commonly exposes Fortran-contiguous NIfTI arrays.  The viewer must
+    # use basic slicing rather than np.take, which is extremely slow on large
+    # F-order 3-D arrays.
+    data = np.asfortranarray(np.arange(8 * 9 * 10).reshape((8, 9, 10)))
+
+    def _forbidden_take(*args, **kwargs):
+        raise AssertionError("extract_display_slice must not call np.take")
+
+    monkeypatch.setattr(np, "take", _forbidden_take)
+    axial = extract_display_slice(data, axis=2, index=4)
+    expected = np.ascontiguousarray(np.flipud(np.rot90(data[:, :, 4])))
+    np.testing.assert_array_equal(axial, expected)
+    assert axial.flags.c_contiguous
+
+
 def test_slice_centre_world_tracks_selected_plane_index():
     volume = _volume((5, 7, 9))
 
@@ -136,3 +154,30 @@ def test_invalid_physical_spacing_is_rejected():
             row_spacing_mm=0.0,
             column_spacing_mm=1.0,
         )
+
+
+def test_physical_aspect_fast_mode_does_not_upscale():
+    image = np.zeros((200, 400, 3), dtype=np.uint8)
+    corrected = physical_aspect_resize(
+        image,
+        row_spacing_mm=2.0,
+        column_spacing_mm=1.0,
+        max_side=560,
+        allow_upscale=False,
+    )
+    # Physical shape is square (200*2 mm == 400*1 mm), so only the taller
+    # pixel dimension is reduced; no axis is inflated beyond the input box.
+    assert corrected.shape == (200, 200, 3)
+
+
+def test_physical_aspect_fast_mode_respects_render_cap():
+    image = np.zeros((1000, 800, 3), dtype=np.uint8)
+    corrected = physical_aspect_resize(
+        image,
+        row_spacing_mm=1.0,
+        column_spacing_mm=1.0,
+        max_side=560,
+        allow_upscale=False,
+    )
+    assert max(corrected.shape[:2]) <= 560
+    assert corrected.shape[0] / corrected.shape[1] == pytest.approx(1000 / 800, rel=0.01)

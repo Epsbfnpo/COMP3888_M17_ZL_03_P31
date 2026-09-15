@@ -1,10 +1,13 @@
 from __future__ import annotations
+import io
 import os
 import sys
+import time
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+from PIL import Image
 
 #allow streamlit to run from the project root without installing src
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -54,7 +57,34 @@ DEFAULT_COST_MATRIX_DIR = "outputs/tracking_pipeline_11/lesion_pair_cost_matrice
 DEFAULT_PAIR_COSTS = "outputs/tracking_pipeline_11/lesion_pair_costs.csv"
 DEFAULT_EVALUATION_DETAILS = "outputs/tracking_evaluation_15/lesion_tracking_details.csv"
 DEFAULT_EVALUATION_SUMMARY = "outputs/tracking_evaluation_15/lesion_tracking_summary.csv"
-APP_VERSION = "V4.4 · Alignment + tracking summary"
+APP_VERSION = "V4.7 · Fast NIfTI slicing + tracking summary"
+
+# Three panels are displayed side-by-side, so rendering 900 px intermediates is
+# unnecessary and expensive during slider interaction. The environment variable
+# is useful for high-resolution screenshots without changing code.
+try:
+    VIEWER_RENDER_MAX_SIDE = max(256, min(1200, int(os.environ.get("P31_VIEWER_MAX_SIDE", "560"))))
+except ValueError:
+    VIEWER_RENDER_MAX_SIDE = 560
+
+# Streamlit sliders are server-driven: every new slice still requires a small
+# Python rerun and a browser round-trip.  To keep that interaction responsive,
+# cache already-rendered JPEG panels and pre-render a small neighbourhood around
+# the current slice.  This keeps the quantitative NIfTI data untouched; the
+# cache is display-only.
+try:
+    VIEWER_PREFETCH_RADIUS = max(0, min(24, int(os.environ.get("P31_VIEWER_PREFETCH_RADIUS", "0"))))
+except ValueError:
+    VIEWER_PREFETCH_RADIUS = 0
+try:
+    VIEWER_CACHE_MAX_ENTRIES = max(24, min(512, int(os.environ.get("P31_VIEWER_CACHE_ENTRIES", "160"))))
+except ValueError:
+    VIEWER_CACHE_MAX_ENTRIES = 160
+try:
+    VIEWER_JPEG_QUALITY = max(70, min(95, int(os.environ.get("P31_VIEWER_JPEG_QUALITY", "88"))))
+except ValueError:
+    VIEWER_JPEG_QUALITY = 88
+VIEWER_TIMING = os.environ.get("P31_VIEWER_TIMING", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 @st.cache_data(show_spinner=False)
 def _patient_ids(manifest_path: str, modified_ns: int) -> tuple[str, ...]:
@@ -326,12 +356,16 @@ def _mask_slice(
     *,
     axis: int,
 ) -> np.ndarray:
-    #extract and orient the mask slice in the image plane
-    return extract_display_slice(
-        np.asarray(volume) > 0,
+    # Extract the requested 2-D plane first, then threshold that plane only.
+    # The previous implementation evaluated ``volume > 0`` for the *entire*
+    # 3-D mask on every slider event.  For large Cohort A masks this could
+    # allocate/process hundreds of MB just to display one slice.
+    display_slice = extract_display_slice(
+        np.asarray(volume),
         axis=axis,
         index=index,
     )
+    return np.ascontiguousarray(display_slice > 0)
 
 def _normalise_optional_path(text: str) -> str | None:
     value = str(text).strip()
@@ -354,6 +388,78 @@ def _safe_float(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if np.isfinite(number) else None
+
+
+def _arrow_safe_display_value(value: object) -> str:
+    """Convert mixed NumPy/Pandas scalars to one Arrow-safe display type.
+
+    Streamlit's dataframe transport uses PyArrow.  A column mixing floats,
+    strings and ``np.bool_`` values can trigger an ArrowInvalid exception and
+    force Streamlit to retry with automatic type fixes on every full rerun.
+    For the small human-readable cost-details table a string representation is
+    clearer and avoids that fallback entirely.
+    """
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is None:
+        return "—"
+    try:
+        if pd.isna(value):
+            return "—"
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return "—"
+        return f"{value:.6g}"
+    return str(value)
+
+
+def _encode_viewer_jpeg(image: np.ndarray) -> bytes:
+    """Encode a display-only uint8 panel once for fast repeated slider use."""
+    arr = np.asarray(image, dtype=np.uint8)
+    buffer = io.BytesIO()
+    Image.fromarray(arr).save(
+        buffer,
+        format="JPEG",
+        quality=VIEWER_JPEG_QUALITY,
+        optimize=False,
+        subsampling=0,
+    )
+    return buffer.getvalue()
+
+
+def _viewer_slice_cache() -> dict[tuple[object, ...], dict[str, object]]:
+    cache = st.session_state.get("_p31_slice_render_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+        st.session_state["_p31_slice_render_cache"] = cache
+    return cache
+
+
+def _viewer_cache_get(
+    cache: dict[tuple[object, ...], dict[str, object]],
+    key: tuple[object, ...],
+) -> dict[str, object] | None:
+    value = cache.pop(key, None)
+    if value is not None:
+        # Move hits to the end so eviction behaves approximately like LRU.
+        cache[key] = value
+    return value
+
+
+def _viewer_cache_put(
+    cache: dict[tuple[object, ...], dict[str, object]],
+    key: tuple[object, ...],
+    value: dict[str, object],
+) -> None:
+    cache.pop(key, None)
+    cache[key] = value
+    while len(cache) > VIEWER_CACHE_MAX_ENTRIES:
+        oldest = next(iter(cache))
+        cache.pop(oldest, None)
 
 
 @st.cache_data(show_spinner=False)
@@ -566,7 +672,13 @@ def _render_matching_panel(
 
     # Optional tested-subset summary for P31-22. It reuses the same combined
     # lesion_matches.csv and the P31-18 evaluation summary; no matching is rerun.
-    with st.expander("Tested Cohort A subset summary"):
+    dataset_label = os.environ.get("P31_DATASET_LABEL", "").strip()
+    subset_summary_title = (
+        f"Tested {dataset_label} subset summary"
+        if dataset_label
+        else "Tested subset summary"
+    )
+    with st.expander(subset_summary_title):
         try:
             all_matches = load_tracking_matches(results_path)
             cohort_summary = build_tracking_summary(
@@ -600,7 +712,7 @@ def _render_matching_panel(
             st.dataframe(
                 display_summary[cohort_columns],
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
             overall = cohort_summary.loc[cohort_summary["patient_id"] == "ALL"]
             if not overall.empty:
@@ -664,7 +776,7 @@ def _render_matching_panel(
     st.dataframe(
         display_matches[display_columns],
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
     st.caption(f"Matching results: {results_path}")
 
@@ -764,11 +876,14 @@ def _render_matching_panel(
             detail_table = pd.DataFrame(
                 {
                     "Field": available_cost_fields,
-                    "Value": [pair_cost_row.get(field) for field in available_cost_fields],
+                    "Value": [
+                        _arrow_safe_display_value(pair_cost_row.get(field))
+                        for field in available_cost_fields
+                    ],
                 }
             )
             with st.expander("Cost component details"):
-                st.dataframe(detail_table, hide_index=True, use_container_width=True)
+                st.dataframe(detail_table, hide_index=True, width="stretch")
 
         st.caption(f"Matcher feature/cost source: {pair_cost_path}")
     else:
@@ -892,7 +1007,7 @@ def _render_matching_panel(
                 st.dataframe(
                     missed[missed_columns],
                     hide_index=True,
-                    use_container_width=True,
+                    width="stretch",
                 )
 
         st.caption(f"Evaluation source: {evaluation_details_path}")
@@ -991,7 +1106,7 @@ def _render_lesion_focus(
                 f"{location.centroid_voxel[1]:.1f}, "
                 f"{location.centroid_voxel[2]:.1f})"
             ),
-            use_container_width=True,
+            width="stretch",
         )
 
     bl_column, fu_column = st.columns(2)
@@ -1422,7 +1537,15 @@ def _render_slice_viewer(
     registered_bl_mask: LoadedVolume | None,
     fu_mask: LoadedVolume | None,
 ) -> None:
-    #show original BL, registered BL and FU in three columns
+    """Render the interactive three-panel viewer with a small client-facing cache.
+
+    Streamlit fragment reruns are already much cheaper than full-app reruns, but
+    ``st.image`` still has to encode/send three images for every new slider value.
+    We therefore cache JPEG bytes for rendered slices and pre-render nearby slices.
+    This affects display transport only; all NIfTI data and matching outputs remain
+    unchanged.
+    """
+    fragment_started = time.perf_counter()
     modality_name = str(modality).upper()
     fu_info = plane_info(fu_ct, plane_name)
     bl_info = plane_info(bl_ct, plane_name)
@@ -1434,12 +1557,14 @@ def _render_slice_viewer(
         "BL and FU = the exact same FU-space anatomical plane. "
         + ("Lesion masks are ON." if show_masks else "Lesion masks are OFF.")
     )
+
     slice_count = fu_info.slice_count
     state_key = f"slice_{patient_id}_{plane_name.lower()}"
     if state_key not in st.session_state:
         st.session_state[state_key] = slice_count // 2
     elif not 0 <= int(st.session_state[state_key]) < slice_count:
         st.session_state[state_key] = slice_count // 2
+
     slice_index = st.slider(
         f"FU-space {plane_name.lower()} slice",
         min_value=0,
@@ -1447,17 +1572,40 @@ def _render_slice_viewer(
         step=1,
         key=state_key,
     )
-    world_xyz = slice_centre_world_mm(
-        fu_ct,
-        plane=plane_name,
-        index=slice_index,
+
+    # Values that change the appearance of a rendered panel belong in the cache
+    # namespace.  The cache is session-local and is explicitly cleared after a
+    # new registration, so paths + display settings are sufficient here.
+    cache_namespace = (
+        str(patient_id),
+        modality_name,
+        str(plane_name),
+        bool(show_masks),
+        round(float(display_low), 6),
+        round(float(display_high), 6),
+        int(VIEWER_RENDER_MAX_SIDE),
+        int(VIEWER_JPEG_QUALITY),
+        str(bl_ct.metadata.path),
+        str(fu_ct.metadata.path),
+        str(bl_mask.metadata.path) if bl_mask is not None else "",
+        str(registered_bl_mask.metadata.path) if registered_bl_mask is not None else "",
+        str(fu_mask.metadata.path) if fu_mask is not None else "",
     )
-    original_index, original_float_index, outside_fov = _mapped_native_bl_slice(
-        mapped_axis_by_fu_slice,
-        fu_slice_index=slice_index,
-        bl_slice_count=bl_info.slice_count,
-    )
-    try:
+    cache = _viewer_slice_cache()
+
+    bl_row_mm, bl_col_mm = display_pixel_spacing_mm(bl_ct, plane_name)
+    fu_row_mm, fu_col_mm = display_pixel_spacing_mm(fu_ct, plane_name)
+
+    def _cache_key(index: int) -> tuple[object, ...]:
+        return cache_namespace + (int(index),)
+
+    def _build_rendered_slice(index: int) -> dict[str, object]:
+        original_index, original_float_index, outside_fov = _mapped_native_bl_slice(
+            mapped_axis_by_fu_slice,
+            fu_slice_index=int(index),
+            bl_slice_count=bl_info.slice_count,
+        )
+
         original_slice = _uint8_slice(
             original_display,
             original_index,
@@ -1465,14 +1613,15 @@ def _render_slice_viewer(
         )
         registered_slice = _uint8_slice(
             registered_display,
-            slice_index,
+            int(index),
             axis=fu_info.voxel_axis,
         )
         fu_slice = _uint8_slice(
             fu_display,
-            slice_index,
+            int(index),
             axis=fu_info.voxel_axis,
         )
+
         original_mask_slice = None
         registered_mask_slice = None
         fu_mask_slice = None
@@ -1486,50 +1635,85 @@ def _render_slice_viewer(
             if registered_bl_mask is not None:
                 registered_mask_slice = _mask_slice(
                     registered_bl_mask.data,
-                    slice_index,
+                    int(index),
                     axis=fu_info.voxel_axis,
                 )
             if fu_mask is not None:
                 fu_mask_slice = _mask_slice(
                     fu_mask.data,
-                    slice_index,
+                    int(index),
                     axis=fu_info.voxel_axis,
                 )
+
         original_slice = _overlay_mask(original_slice, original_mask_slice)
         registered_slice = _overlay_mask(registered_slice, registered_mask_slice)
         fu_slice = _overlay_mask(fu_slice, fu_mask_slice)
-        #preserve image proportions with native BL spacing for original BL and FU spacing for both aligned panels
-        bl_row_mm, bl_col_mm = display_pixel_spacing_mm(bl_ct, plane_name)
-        fu_row_mm, fu_col_mm = display_pixel_spacing_mm(fu_ct, plane_name)
+
         original_slice = physical_aspect_resize(
             original_slice,
             row_spacing_mm=bl_row_mm,
             column_spacing_mm=bl_col_mm,
+            max_side=VIEWER_RENDER_MAX_SIDE,
+            allow_upscale=False,
         )
         registered_slice = physical_aspect_resize(
             registered_slice,
             row_spacing_mm=fu_row_mm,
             column_spacing_mm=fu_col_mm,
+            max_side=VIEWER_RENDER_MAX_SIDE,
+            allow_upscale=False,
         )
         fu_slice = physical_aspect_resize(
             fu_slice,
             row_spacing_mm=fu_row_mm,
             column_spacing_mm=fu_col_mm,
+            max_side=VIEWER_RENDER_MAX_SIDE,
+            allow_upscale=False,
         )
-    except Exception as exc:
-        st.error(f"Could not render current {plane_name.lower()} slices: {exc}")
-        return
+
+        return {
+            "original_image": _encode_viewer_jpeg(original_slice),
+            "registered_image": _encode_viewer_jpeg(registered_slice),
+            "fu_image": _encode_viewer_jpeg(fu_slice),
+            "original_index": int(original_index),
+            "original_float_index": float(original_float_index),
+            "outside_fov": bool(outside_fov),
+        }
+
+    current_key = _cache_key(slice_index)
+    current_entry = _viewer_cache_get(cache, current_key)
+    cache_hit = current_entry is not None
+    current_render_started = time.perf_counter()
+    if current_entry is None:
+        try:
+            current_entry = _build_rendered_slice(slice_index)
+        except Exception as exc:
+            st.error(f"Could not render current {plane_name.lower()} slices: {exc}")
+            return
+        _viewer_cache_put(cache, current_key, current_entry)
+    current_render_ms = (time.perf_counter() - current_render_started) * 1000.0
+
+    world_xyz = slice_centre_world_mm(
+        fu_ct,
+        plane=plane_name,
+        index=slice_index,
+    )
+    original_index = int(current_entry["original_index"])
+    original_float_index = float(current_entry["original_float_index"])
+    outside_fov = bool(current_entry["outside_fov"])
+
     if modality_name == "CT":
         intensity_text = f"window [{display_low:.0f}, {display_high:.0f}] HU"
     else:
         intensity_text = (
             f"PET display percentile range ≈ [{display_low:.3g}, {display_high:.3g}]"
         )
+
     st.caption(
         f"FU-space {plane_name.lower()} slice {slice_index + 1}/{slice_count} · "
         f"world centre ≈ ({world_xyz[0]:.1f}, {world_xyz[1]:.1f}, "
         f"{world_xyz[2]:.1f}) mm · {intensity_text} · "
-        "display aspect = physical voxel spacing"
+        f"display aspect = physical voxel spacing · cached JPEG render ≤ {VIEWER_RENDER_MAX_SIDE}px"
     )
     if outside_fov:
         st.warning(
@@ -1537,35 +1721,80 @@ def _render_slice_viewer(
             f"{plane_name.lower()} range. The Original BL panel is showing "
             f"the nearest edge slice ({original_index})."
         )
+
+    # Supplying pre-encoded bytes avoids Streamlit/Pillow re-encoding three NumPy
+    # arrays on every slider rerun.  The browser receives small local JPEGs only.
     before, after, reference = st.columns(3)
     with before:
         st.markdown(f"**Original BL {modality_name}**")
         st.image(
-            original_slice,
+            current_entry["original_image"],
             caption=(
                 f"Native-BL grid · rigid-mapped {plane_name.lower()} slice "
                 f"{original_index} (mapped index={original_float_index:.1f})"
             ),
-            use_container_width=True,
+            width="stretch",
         )
     with after:
         st.markdown(f"**Registered BL {modality_name}**")
         st.image(
-            registered_slice,
+            current_entry["registered_image"],
             caption=(
                 f"After alignment · FU-space {plane_name.lower()} "
                 f"slice {slice_index}"
             ),
-            use_container_width=True,
+            width="stretch",
         )
     with reference:
         st.markdown(f"**FU {modality_name}**")
         st.image(
-            fu_slice,
+            current_entry["fu_image"],
             caption=(
                 f"Reference · FU-space {plane_name.lower()} slice {slice_index}"
             ),
-            use_container_width=True,
+            width="stretch",
+        )
+
+    # Optional neighbour prefetch.  This is OFF by default in V4.7 because
+    # synchronous pre-rendering blocks the Streamlit fragment after a large
+    # slider jump.  With direct F-order-safe slicing, individual cache misses are
+    # already cheap; users can opt back in with P31_VIEWER_PREFETCH_RADIUS.
+    prefetch_started = time.perf_counter()
+    prefetched = 0
+    if not cache_hit and VIEWER_PREFETCH_RADIUS > 0:
+        neighbour_indices: list[int] = []
+        for distance in range(1, VIEWER_PREFETCH_RADIUS + 1):
+            lower = int(slice_index) - distance
+            upper = int(slice_index) + distance
+            if lower >= 0:
+                neighbour_indices.append(lower)
+            if upper < slice_count:
+                neighbour_indices.append(upper)
+
+        for neighbour in neighbour_indices:
+            neighbour_key = _cache_key(neighbour)
+            if neighbour_key in cache:
+                continue
+            try:
+                neighbour_entry = _build_rendered_slice(neighbour)
+            except Exception:
+                # Prefetch is a performance optimisation only.  A bad neighbour
+                # must never prevent the requested current slice from displaying.
+                continue
+            _viewer_cache_put(cache, neighbour_key, neighbour_entry)
+            prefetched += 1
+    prefetch_ms = (time.perf_counter() - prefetch_started) * 1000.0
+
+    if VIEWER_TIMING:
+        total_ms = (time.perf_counter() - fragment_started) * 1000.0
+        print(
+            "[P31 viewer] "
+            f"patient={patient_id} modality={modality_name} plane={plane_name} "
+            f"slice={slice_index} cache={'HIT' if cache_hit else 'MISS'} "
+            f"current_render={current_render_ms:.1f}ms "
+            f"prefetched={prefetched} prefetch={prefetch_ms:.1f}ms "
+            f"cache_entries={len(cache)} fragment_python={total_ms:.1f}ms",
+            flush=True,
         )
 
 def main() -> None:
@@ -1585,7 +1814,7 @@ def main() -> None:
         st.header("Data")
         manifest_text = st.text_input(
             "Pair manifest",
-            value=DEFAULT_PAIRS,
+            value=os.environ.get("P31_PAIR_MANIFEST", DEFAULT_PAIRS),
             help="Usually outputs/cohort_a_subset/cohort_a_subset_pairs.csv",
         )
         data_root_text = st.text_input(
@@ -1602,7 +1831,7 @@ def main() -> None:
         )
         output_root_text = st.text_input(
             "Registration output root",
-            value=DEFAULT_OUTPUT_ROOT,
+            value=os.environ.get("P31_REGISTRATION_ROOT", DEFAULT_OUTPUT_ROOT),
         )
     manifest_path = Path(manifest_text).expanduser()
     if not manifest_path.exists():
@@ -1624,7 +1853,7 @@ def main() -> None:
         run_alignment = st.button(
             "Run / re-run alignment",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
         st.header("Viewer")
         display_modality = st.selectbox(
@@ -1666,7 +1895,7 @@ def main() -> None:
         st.header("Lesion matching")
         match_results_text = st.text_input(
             "Matching results CSV",
-            value=DEFAULT_MATCH_RESULTS,
+            value=os.environ.get("P31_MATCH_RESULTS", DEFAULT_MATCH_RESULTS),
             help=(
                 "A combined lesion_matches.csv. Results for the selected patient "
                 "are loaded automatically."
@@ -1674,7 +1903,7 @@ def main() -> None:
         )
         aligned_features_text = st.text_input(
             "Aligned lesion features CSV",
-            value=DEFAULT_ALIGNED_FEATURES,
+            value=os.environ.get("P31_ALIGNED_FEATURES", DEFAULT_ALIGNED_FEATURES),
             help=(
                 "Provides FU-grid BL/FU lesion centroids used to locate a "
                 "selected correspondence on the aligned scans."
@@ -1682,12 +1911,12 @@ def main() -> None:
         )
         cost_matrix_dir_text = st.text_input(
             "Cost matrix directory",
-            value=DEFAULT_COST_MATRIX_DIR,
+            value=os.environ.get("P31_COST_MATRIX_DIR", DEFAULT_COST_MATRIX_DIR),
             help="Contains <patient_id>_cost_matrix.csv files.",
         )
         pair_costs_text = st.text_input(
             "Pair-cost details CSV",
-            value=DEFAULT_PAIR_COSTS,
+            value=os.environ.get("P31_PAIR_COSTS", DEFAULT_PAIR_COSTS),
             help=(
                 "Optional long-form lesion_pair_costs.csv used to show distance, "
                 "volume, size difference, PET features, and cost components."
@@ -1695,7 +1924,7 @@ def main() -> None:
         )
         evaluation_details_text = st.text_input(
             "Ground-truth evaluation details CSV",
-            value=DEFAULT_EVALUATION_DETAILS,
+            value=os.environ.get("P31_EVAL_DETAILS", DEFAULT_EVALUATION_DETAILS),
             help=(
                 "Optional lesion_tracking_details.csv. When available, the selected "
                 "prediction is labelled CORRECT/INCORRECT and missed GT events are shown."
@@ -1703,7 +1932,7 @@ def main() -> None:
         )
         evaluation_summary_text = st.text_input(
             "Ground-truth evaluation summary CSV",
-            value=DEFAULT_EVALUATION_SUMMARY,
+            value=os.environ.get("P31_EVAL_SUMMARY", DEFAULT_EVALUATION_SUMMARY),
             help=(
                 "Optional lesion_tracking_summary.csv from P31-18. Used for "
                 "per-patient correct/incorrect counts, tracking accuracy, and the "
@@ -1728,7 +1957,7 @@ def main() -> None:
             )
         run_matching = st.button(
             "Run / re-run lesion matching",
-            use_container_width=True,
+            width="stretch",
             help="Runs NetworkX min-cost-flow for the selected patient only.",
         )
     data_root = _normalise_optional_path(data_root_text)
@@ -1777,6 +2006,7 @@ def main() -> None:
             _load_registered_mask_cached.clear()
             _load_registered_pet_cached.clear()
             st.session_state.pop("_alignment_display_cache", None)
+            st.session_state.pop("_p31_slice_render_cache", None)
             st.success(f"Alignment completed: {registered_path}")
         except RegistrationError as exc:
             st.error(str(exc))
