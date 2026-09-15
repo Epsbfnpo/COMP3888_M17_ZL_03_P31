@@ -29,6 +29,39 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+## Makefile commands
+
+Run these commands from root with GNU Make installed (on Windows,
+use WSL or a shell with GNU Make). Activate python virtual environment first
+which shown above. `make setup` installs dependencies into the selected interpreter.
+
+```bash
+make setup
+make manifest DATA="/path/to/cohort_a"
+make lesions DATA="/path/to/cohort_a"
+make pipeline DATA="/path/to/cohort_a"
+make test
+```
+
+`manifest` selects first 5 patients and writes the cohort A manifests.
+`lesions` uses the existing pair manifest and exports 1 BL/FU lesion CSV per
+patient to `outputs/cohort_a_lesions/<patient_id>.csv`. It stops on extraction
+failure. `pipeline` generates manifest before extracting lesions, including
+when invoked with `make -j`. Running `make` alone runs `pipeline`.
+
+`DATA` defaults to `COHORT_A_ROOT` when set, otherwise `data/cohort_a`.
+Both manifest generation and extraction use same root. Override
+`PYTHON` (default `python3`) to choose an interpreter, for example
+`make setup PYTHON=python`. Other overrides are `MAX_PATIENTS` (default `5`),
+`OUT_DIR` (default `outputs/cohort_a_subset`), `PAIRS` (default
+`$(OUT_DIR)/cohort_a_subset_pairs.csv`), and `LESIONS_DIR` (default
+`outputs/cohort_a_lesions`). For `pipeline`, keep `PAIRS` at its default so
+extraction uses the new generated manifest.
+
+```bash
+make pipeline DATA="/path with spaces/cohort_a" MAX_PATIENTS=2
+```
+
 ## Generate the manifest
 
 Place or mount the Cohort A subset anywhere on your local machine. The script
@@ -288,4 +321,3 @@ handling.
 - Temporary unique ID — `<patient>_<BL/FU>_L###`
 - BL/FU lesion counts — `LesionExtractionResult.lesion_count`
 - Empty/invalid masks — explicit `EmptyLesionMaskError` / `LesionMaskError`
-
