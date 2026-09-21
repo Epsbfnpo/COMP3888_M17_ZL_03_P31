@@ -1,6 +1,7 @@
 from __future__ import annotations
 import io
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -32,6 +33,12 @@ from src.registration_mapping import (  # noqa: E402
 )
 from src.correspondence_visualization import OUTCOME_STYLES, selected_lesion_mask, lesion_display_slice
 from src.lesion_min_cost_flow import MatcherConfig  # noqa: E402
+from src.lesion_pair_costs import (  # noqa: E402
+    LesionPairCostError,
+    PairCostConfig,
+    export_cost_matrices,
+    generate_lesion_pair_costs,
+)
 from src.matching_dashboard import (  # noqa: E402
     MatchImageFocus,
     MatchingDashboardError,
@@ -58,15 +65,10 @@ from src.multiplanar_view import (  # noqa: E402
     slice_centre_world_mm,
 )
 
+DEFAULT_DATA_ROOT = "./data"
 DEFAULT_PAIRS = "outputs/cohort_a_subset/cohort_a_subset_pairs.csv"
-DEFAULT_OUTPUT_ROOT = "outputs/registration"
-DEFAULT_MATCH_RESULTS = "outputs/tracking_pipeline_11/lesion_matches.csv"
-DEFAULT_ALIGNED_FEATURES = "outputs/tracking_pipeline_11/aligned_lesion_features.csv"
-DEFAULT_COST_MATRIX_DIR = "outputs/tracking_pipeline_11/lesion_pair_cost_matrices"
-DEFAULT_PAIR_COSTS = "outputs/tracking_pipeline_11/lesion_pair_costs.csv"
-DEFAULT_EVALUATION_DETAILS = "outputs/tracking_evaluation_15/lesion_tracking_details.csv"
-DEFAULT_EVALUATION_SUMMARY = "outputs/tracking_evaluation_15/lesion_tracking_summary.csv"
-APP_VERSION = "V4.9 · Modular registration transforms"
+DEFAULT_PATIENT_OUTPUT_ROOT = "outputs/patients"
+APP_VERSION = "V5.0 · Patient-driven automatic pipeline"
 
 # Three panels are displayed side-by-side, so rendering 900 px intermediates is
 # unnecessary and expensive during slider interaction. The environment variable
@@ -353,6 +355,261 @@ def _patient_auxiliary_rows(path: Path, patient_id: str) -> pd.DataFrame | None:
     return frame[frame["patient_id"] == str(patient_id)].copy()
 
 
+def _patient_output_paths(
+    output_root: str | Path,
+    patient_id: str,
+) -> dict[str, Path]:
+    """Return every generated path for one patient from one output root."""
+    root = Path(output_root).expanduser()
+    patient_dir = root / str(patient_id)
+    evaluation_dir = patient_dir / "evaluation"
+    return {
+        "output_root": root,
+        "patient_dir": patient_dir,
+        # Registration files are stored directly in patient_dir so the batch
+        # feature generator and the interactive viewer reuse the same result.
+        "registration_dir": patient_dir,
+        "registered_ct": patient_dir / "registered_baseline_ct.nii.gz",
+        "registered_mask": patient_dir / "registered_baseline_lesion_mask.nii.gz",
+        "registered_pet": patient_dir / "registered_baseline_pet.nii.gz",
+        "aligned_features": patient_dir / "aligned_lesion_features.csv",
+        "aligned_status": patient_dir / "aligned_lesion_features_status.csv",
+        "pair_costs": patient_dir / "lesion_pair_costs.csv",
+        "matrix_dir": patient_dir / "lesion_pair_cost_matrices",
+        "matches": patient_dir / "lesion_matches.csv",
+        "evaluation_dir": evaluation_dir,
+        "evaluation_details": evaluation_dir / "lesion_tracking_details.csv",
+        "evaluation_summary": evaluation_dir / "lesion_tracking_summary.csv",
+    }
+
+
+def _pipeline_tool_path(filename: str) -> Path:
+    """Resolve a repository tool whether this dashboard is in tools/ or root/."""
+    candidates = (
+        PROJECT_ROOT / "tools" / filename,
+        PROJECT_ROOT / filename,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise MatchingDashboardError(
+        f"Required pipeline tool was not found: tools/{filename}"
+    )
+
+
+def _run_pipeline_command(command: list[str], *, label: str) -> None:
+    """Run one existing project CLI and surface a concise actionable error."""
+    completed = subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode == 0:
+        return
+    combined = "\n".join(
+        part.strip() for part in (completed.stdout, completed.stderr) if part.strip()
+    )
+    tail = "\n".join(combined.splitlines()[-20:])
+    raise MatchingDashboardError(
+        f"{label} failed with exit code {completed.returncode}."
+        + (f"\n{tail}" if tail else "")
+    )
+
+
+def _prepare_pair_manifest(data_root: Path, manifest_path: Path) -> Path:
+    """Create the patient manifest automatically when only raw ./data exists."""
+    script = _pipeline_tool_path("prepare_cohort_a_subset.py")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    _run_pipeline_command(
+        [
+            sys.executable,
+            str(script),
+            "--root",
+            str(data_root),
+            "--out-dir",
+            str(manifest_path.parent),
+            "--max-patients",
+            "999999",
+            "--path-mode",
+            "relative-to-root",
+        ],
+        label="Patient-manifest preparation",
+    )
+    if not manifest_path.is_file():
+        raise MatchingDashboardError(
+            f"Manifest preparation finished but did not create: {manifest_path}"
+        )
+    return manifest_path
+
+
+def _ensure_aligned_features(
+    *,
+    patient_id: str,
+    manifest_path: Path,
+    data_root: str | None,
+    paths: dict[str, Path],
+) -> Path:
+    """Reuse valid patient features or generate them from the selected pair."""
+    feature_path = paths["aligned_features"]
+    registration_path = paths["registered_ct"]
+    feature_is_current = (
+        feature_path.is_file()
+        and (
+            not registration_path.is_file()
+            or feature_path.stat().st_mtime_ns >= registration_path.stat().st_mtime_ns
+        )
+    )
+    if feature_is_current:
+        try:
+            existing = load_patient_features(feature_path, patient_id)
+            if not existing.empty:
+                return feature_path
+        except (FileNotFoundError, MatchingDashboardError, pd.errors.ParserError):
+            pass
+
+    script = _pipeline_tool_path("generate_aligned_lesion_features_batch.py")
+    paths["patient_dir"].mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        str(script),
+        "--pairs",
+        str(manifest_path),
+        "--patient-ids",
+        str(patient_id),
+        "--expected-patients",
+        "1",
+        "--out",
+        str(feature_path),
+        "--status-out",
+        str(paths["aligned_status"]),
+        "--registration-root",
+        str(paths["output_root"]),
+        "--aligned-mask-root",
+        str(paths["output_root"] / "aligned_masks"),
+        "--connectivity",
+        "18",
+    ]
+    if data_root:
+        command.extend(["--data-root", str(data_root)])
+    _run_pipeline_command(command, label=f"Aligned-feature generation for {patient_id}")
+
+    features = load_patient_features(feature_path, patient_id)
+    if features.empty:
+        raise MatchingDashboardError(
+            f"Aligned-feature generation produced no rows for patient '{patient_id}'."
+        )
+    return feature_path
+
+
+def _run_patient_evaluation(
+    *,
+    patient_id: str,
+    manifest_path: Path,
+    data_root: str | None,
+    paths: dict[str, Path],
+    config: MatcherConfig,
+) -> None:
+    """Evaluate the selected patient without exposing any CSV path in the UI."""
+    script = _pipeline_tool_path("run_tracking_evaluation_batch.py")
+    paths["evaluation_dir"].mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        str(script),
+        "--pairs",
+        str(manifest_path),
+        "--features",
+        str(paths["aligned_features"]),
+        "--patient-ids",
+        str(patient_id),
+        "--expected-patients",
+        "1",
+        "--out-dir",
+        str(paths["evaluation_dir"]),
+        "--reuse-matrices",
+        "--matrix-dir",
+        str(paths["matrix_dir"]),
+        "--disappearing-penalty",
+        str(config.disappearing_penalty),
+        "--new-lesion-penalty",
+        str(config.new_lesion_penalty),
+        "--merge-penalty",
+        str(config.merge_penalty),
+        "--max-bl-per-fu",
+        str(config.max_bl_per_fu),
+    ]
+    if data_root:
+        command.extend(["--data-root", str(data_root)])
+    _run_pipeline_command(command, label=f"Ground-truth evaluation for {patient_id}")
+    _load_csv_cached.clear()
+
+
+def _save_patient_pair_costs(
+    path: Path,
+    patient_id: str,
+    patient_pair_costs: pd.DataFrame,
+) -> Path:
+    """Replace one patient's pair-cost rows while preserving other patients."""
+    output_path = path.expanduser()
+    selected_id = str(patient_id).strip()
+    replacement = patient_pair_costs.copy()
+    if "patient_id" not in replacement.columns:
+        raise MatchingDashboardError(
+            "Generated pair costs are missing the required patient_id column."
+        )
+    replacement["patient_id"] = replacement["patient_id"].astype(str).str.strip()
+    if not replacement.empty and set(replacement["patient_id"]) != {selected_id}:
+        raise MatchingDashboardError(
+            "Generated pair costs contain rows for a different patient."
+        )
+
+    if output_path.exists():
+        try:
+            existing = pd.read_csv(output_path, dtype={"patient_id": str})
+        except Exception as exc:
+            raise MatchingDashboardError(
+                f"Could not read pair-cost CSV '{output_path}': {exc}"
+            ) from exc
+        if "patient_id" not in existing.columns:
+            raise MatchingDashboardError(
+                f"Pair-cost CSV is missing the required patient_id column: {output_path}"
+            )
+        existing["patient_id"] = existing["patient_id"].fillna("").str.strip()
+        existing = existing.loc[existing["patient_id"] != selected_id].copy()
+    else:
+        existing = pd.DataFrame(columns=replacement.columns)
+
+    combined = pd.concat([existing, replacement], ignore_index=True, sort=False)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(output_path.name + ".tmp")
+    combined.to_csv(temporary_path, index=False)
+    temporary_path.replace(output_path)
+    return output_path
+
+
+def _generate_patient_cost_inputs(
+    *,
+    patient_id: str,
+    feature_path: Path,
+    results_path: Path,
+    pair_cost_path: Path,
+) -> tuple[Path, int]:
+    """Generate and persist the selected patient's matrix and pair-cost details."""
+    features = load_patient_features(feature_path, patient_id)
+    generated = generate_lesion_pair_costs(features, PairCostConfig())
+    _save_patient_pair_costs(pair_cost_path, patient_id, generated.pair_costs)
+
+    matrix_dir = results_path.expanduser().parent / "lesion_pair_cost_matrices"
+    matrix_paths = export_cost_matrices(generated.matrices, matrix_dir)
+    if len(matrix_paths) != 1:
+        raise MatchingDashboardError(
+            f"Expected one generated cost matrix for patient '{patient_id}', "
+            f"but generated {len(matrix_paths)}."
+        )
+    return matrix_paths[0], len(generated.pair_costs)
+
+
 def _event_row(
     frame: pd.DataFrame | None,
     *,
@@ -402,16 +659,20 @@ def _format_metric_number(value: object, *, digits: int = 3, suffix: str = "") -
 def _render_matching_panel(
     *,
     patient_id: str,
-    results_path: Path,
-    feature_path: Path,
-    matrix_dir: Path,
-    pair_cost_path: Path,
-    evaluation_details_path: Path | None,
-    evaluation_summary_path: Path | None,
+    manifest_path: Path,
+    data_root: str | None,
+    paths: dict[str, Path],
     run_matching: bool,
+    run_evaluation: bool,
     config: MatcherConfig,
 ) -> MatchImageFocus | None:
     # Run/load matching, then expose the evidence required by Jira P31-21.
+    results_path = paths["matches"]
+    feature_path = paths["aligned_features"]
+    pair_cost_path = paths["pair_costs"]
+    evaluation_details_path = paths["evaluation_details"]
+    evaluation_summary_path = paths["evaluation_summary"]
+
     st.subheader("Lesion correspondence")
     st.caption(
         "Automatic BL ↔ FU outcomes for the selected patient. Select an event "
@@ -419,24 +680,57 @@ def _render_matching_panel(
         "and ground-truth agreement when evaluation data is available."
     )
 
-    matrix_path = matrix_dir / f"{patient_id}_cost_matrix.csv"
+    automatic_matrix_dir = paths["matrix_dir"]
+    st.caption(
+        "The selected patient's cost matrix is generated automatically from the "
+        f"aligned features and saved under: {automatic_matrix_dir}"
+    )
 
-    if run_matching:
+    if run_matching or run_evaluation:
         try:
-            with st.spinner(f"Running min-cost-flow matching for {patient_id}..."):
+            with st.spinner(
+                f"Preparing features, cost matrix, and matches for {patient_id}..."
+            ):
+                _ensure_aligned_features(
+                    patient_id=patient_id,
+                    manifest_path=manifest_path,
+                    data_root=data_root,
+                    paths=paths,
+                )
+                matrix_path, candidate_count = _generate_patient_cost_inputs(
+                    patient_id=patient_id,
+                    feature_path=feature_path,
+                    results_path=results_path,
+                    pair_cost_path=pair_cost_path,
+                )
                 run_patient_match(matrix_path, patient_id, results_path, config)
-            st.success(f"Matching completed and saved to {results_path}")
-        except (FileNotFoundError, MatchingDashboardError) as exc:
+                _load_csv_cached.clear()
+            st.success(
+                f"Generated {candidate_count} candidate pair(s), completed matching, "
+                "and saved the patient results."
+            )
+
+            if run_evaluation:
+                with st.spinner(f"Evaluating patient {patient_id} against ground truth..."):
+                    _run_patient_evaluation(
+                        patient_id=patient_id,
+                        manifest_path=manifest_path,
+                        data_root=data_root,
+                        paths=paths,
+                        config=config,
+                    )
+                st.success("Ground-truth evaluation completed.")
+        except (FileNotFoundError, LesionPairCostError, MatchingDashboardError) as exc:
             st.error(str(exc))
         except Exception as exc:
-            st.error(f"Unexpected matching failure for patient '{patient_id}': {exc}")
+            st.error(f"Unexpected pipeline failure for patient '{patient_id}': {exc}")
 
     try:
         matches = load_patient_matches(results_path, patient_id)
     except FileNotFoundError as exc:
         st.info(
-            f"{exc} Run matching from the sidebar after generating this "
-            "patient's cost matrix."
+            f"{exc} Run matching from the sidebar; the cost matrix will be "
+            "generated automatically for this patient."
         )
         return None
     except MatchingDashboardError as exc:
@@ -797,7 +1091,13 @@ def _render_matching_panel(
 
     # Ground-truth agreement is read only from evaluation output. The dashboard does
     # not use GT to make or change the prediction.
-    st.markdown("#### Ground-truth agreement")
+    st.divider()
+    st.subheader("Ground-truth evaluation")
+    st.caption(
+        "Evaluation uses the selected patient's reference_csv_path from the pair "
+        "manifest; no ground-truth path needs to be entered manually."
+    )
+    st.markdown("#### Selected-event agreement")
 
     evaluation_rows = None
     if evaluation_details_path is not None:
@@ -808,8 +1108,8 @@ def _render_matching_panel(
 
     if evaluation_details_path is None or not evaluation_details_path.exists():
         st.info(
-            "Ground-truth evaluation is unavailable for this view. Provide a "
-            "lesion_tracking_details.csv path in the sidebar to enable it."
+            "Ground-truth evaluation has not been generated for this patient. "
+            "Click **Run ground-truth evaluation** in the sidebar."
         )
     elif evaluation_rows is None or evaluation_rows.empty:
         st.info(
@@ -1505,31 +1805,55 @@ def main() -> None:
     with st.sidebar:
         st.caption(APP_VERSION)
         st.header("Data")
-        manifest_text = st.text_input(
-            "Pair manifest",
-            value=os.environ.get("P31_PAIR_MANIFEST", DEFAULT_PAIRS),
-            help="Usually outputs/cohort_a_subset/cohort_a_subset_pairs.csv",
-        )
         data_root_text = st.text_input(
             "Data root",
             value=(
                 os.environ.get("DATA_ROOT")
                 or os.environ.get("COHORT_B_ROOT")
-                or os.environ.get("COHORT_A_ROOT", "")
+                or os.environ.get("COHORT_A_ROOT")
+                or DEFAULT_DATA_ROOT
             ),
             help=(
-                "Leave blank if manifest paths are self-contained or a data-root "
-                "environment variable is already set."
+                "Raw Cohort A directory containing inputsTr and targetsTr/outputsTr."
             ),
         )
         output_root_text = st.text_input(
-            "Registration output root",
-            value=os.environ.get("P31_REGISTRATION_ROOT", DEFAULT_OUTPUT_ROOT),
+            "Patient output root",
+            value=os.environ.get(
+                "P31_PATIENT_OUTPUT_ROOT",
+                DEFAULT_PATIENT_OUTPUT_ROOT,
+            ),
+            help=(
+                "All registration, feature, matrix, matching, and evaluation "
+                "outputs are organised automatically below this directory."
+            ),
         )
-    manifest_path = Path(manifest_text).expanduser()
-    if not manifest_path.exists():
-        st.error(f"Pair manifest not found: {manifest_path}")
+        refresh_manifest = st.button(
+            "Refresh patient list",
+            width="stretch",
+            help="Rediscover every patient under the selected raw data root.",
+        )
+
+    data_root = _normalise_optional_path(data_root_text)
+    if data_root is None:
+        st.error("Data root cannot be blank.")
         st.stop()
+    data_root_path = Path(data_root).expanduser()
+    manifest_path = Path(
+        os.environ.get("P31_PAIR_MANIFEST", DEFAULT_PAIRS)
+    ).expanduser()
+
+    if refresh_manifest or not manifest_path.exists():
+        try:
+            with st.spinner("Discovering patients and preparing the pair manifest..."):
+                _prepare_pair_manifest(data_root_path, manifest_path)
+            st.success("Patient manifest prepared from the raw data directory.")
+        except Exception as exc:
+            st.error(
+                "Could not prepare the patient list automatically. "
+                f"Check the data root '{data_root_path}'.\n\n{exc}"
+            )
+            st.stop()
     try:
         manifest_modified_ns = manifest_path.stat().st_mtime_ns
         patient_ids = _patient_ids(str(manifest_path), manifest_modified_ns)
@@ -1541,6 +1865,8 @@ def main() -> None:
         st.stop()
     with st.sidebar:
         patient_id = st.selectbox("Patient", options=patient_ids)
+        paths = _patient_output_paths(output_root_text, patient_id)
+
         st.header("Alignment")
         st.write("Conservative baseline: **Rigid only**")
         run_alignment = st.button(
@@ -1586,51 +1912,9 @@ def main() -> None:
             ),
         )
         st.header("Lesion matching")
-        match_results_text = st.text_input(
-            "Matching results CSV",
-            value=os.environ.get("P31_MATCH_RESULTS", DEFAULT_MATCH_RESULTS),
-            help=(
-                "A combined lesion_matches.csv. Results for the selected patient "
-                "are loaded automatically."
-            ),
-        )
-        aligned_features_text = st.text_input(
-            "Aligned lesion features CSV",
-            value=os.environ.get("P31_ALIGNED_FEATURES", DEFAULT_ALIGNED_FEATURES),
-            help=(
-                "Provides FU-grid BL/FU lesion centroids used to locate a "
-                "selected correspondence on the aligned scans."
-            ),
-        )
-        cost_matrix_dir_text = st.text_input(
-            "Cost matrix directory",
-            value=os.environ.get("P31_COST_MATRIX_DIR", DEFAULT_COST_MATRIX_DIR),
-            help="Contains <patient_id>_cost_matrix.csv files.",
-        )
-        pair_costs_text = st.text_input(
-            "Pair-cost details CSV",
-            value=os.environ.get("P31_PAIR_COSTS", DEFAULT_PAIR_COSTS),
-            help=(
-                "Optional long-form lesion_pair_costs.csv used to show distance, "
-                "volume, size difference, PET features, and cost components."
-            ),
-        )
-        evaluation_details_text = st.text_input(
-            "Ground-truth evaluation details CSV",
-            value=os.environ.get("P31_EVAL_DETAILS", DEFAULT_EVALUATION_DETAILS),
-            help=(
-                "Optional lesion_tracking_details.csv. When available, the selected "
-                "prediction is labelled CORRECT/INCORRECT and missed GT events are shown."
-            ),
-        )
-        evaluation_summary_text = st.text_input(
-            "Ground-truth evaluation summary CSV",
-            value=os.environ.get("P31_EVAL_SUMMARY", DEFAULT_EVALUATION_SUMMARY),
-            help=(
-                "Optional lesion_tracking_summary.csv from P31-18. Used for "
-                "per-patient correct/incorrect counts, tracking accuracy, and the "
-                "tested-subset ALL result."
-            ),
+        st.caption(
+            "Features, pair costs, cost matrix, and match results are generated "
+            "automatically for the selected patient."
         )
         with st.expander("Matcher settings"):
             disappearing_penalty = st.number_input(
@@ -1651,15 +1935,46 @@ def main() -> None:
         run_matching = st.button(
             "Run / re-run lesion matching",
             width="stretch",
-            help="Runs NetworkX min-cost-flow for the selected patient only.",
+            help=(
+                "Generates the selected patient's cost matrix from aligned features, "
+                "then runs NetworkX min-cost-flow."
+            ),
         )
-    data_root = _normalise_optional_path(data_root_text)
-    output_root = Path(output_root_text).expanduser()
-    output_dir, registered_path, registered_mask_path = _registration_paths(
-        output_root,
-        patient_id,
-    )
-    registered_pet_path = output_dir / "registered_baseline_pet.nii.gz"
+        st.header("Ground-truth evaluation")
+        st.caption(
+            "The reference CSV is resolved automatically from the selected "
+            "patient's pair-manifest row."
+        )
+        run_evaluation = st.button(
+            "Run ground-truth evaluation",
+            width="stretch",
+            help=(
+                "Ensures matching is current, then computes correct, incorrect, "
+                "missed, and tracking-accuracy results."
+            ),
+        )
+
+        with st.expander("Advanced / debug information"):
+            st.caption("Automatically resolved; these paths are read-only.")
+            st.code(
+                "\n".join(
+                    [
+                        f"Pair manifest: {manifest_path}",
+                        f"Patient directory: {paths['patient_dir']}",
+                        f"Aligned features: {paths['aligned_features']}",
+                        f"Cost matrix directory: {paths['matrix_dir']}",
+                        f"Matches: {paths['matches']}",
+                        f"Evaluation: {paths['evaluation_dir']}",
+                    ]
+                ),
+                language=None,
+            )
+
+    output_dir = paths["registration_dir"]
+    registered_path = paths["registered_ct"]
+    registered_mask_path = paths["registered_mask"]
+    registered_pet_path = paths["registered_pet"]
+    output_dir.mkdir(parents=True, exist_ok=True)
     try:
         pair = _load_pair_cached(
             str(manifest_path),
@@ -1705,6 +2020,29 @@ def main() -> None:
             st.error(str(exc))
         except Exception as exc:
             st.error(f"Unexpected registration failure: {exc}")
+
+    # Matching/evaluation can be started directly from raw data.  If alignment
+    # has not been run yet, aligned-feature generation performs and persists the
+    # same rigid registration before the viewer readiness check below.
+    if (run_matching or run_evaluation) and not _registration_is_ready(
+        output_dir, registered_path
+    ):
+        try:
+            with st.spinner(
+                f"Preparing alignment and lesion features for {patient_id}..."
+            ):
+                _ensure_aligned_features(
+                    patient_id=patient_id,
+                    manifest_path=manifest_path,
+                    data_root=data_root,
+                    paths=paths,
+                )
+            _load_registered_ct_cached.clear()
+            _load_registered_mask_cached.clear()
+            _load_registered_pet_cached.clear()
+        except Exception as exc:
+            st.error(f"Could not prepare matching inputs: {exc}")
+
     ready = _registration_is_ready(output_dir, registered_path)
     if not ready:
         st.info(
@@ -1901,22 +2239,13 @@ def main() -> None:
     st.divider()
     st.header("Lesion Matching")
 
-    evaluation_details_path = None
-    if str(evaluation_details_text).strip():
-        evaluation_details_path = Path(evaluation_details_text).expanduser()
-    evaluation_summary_path = None
-    if str(evaluation_summary_text).strip():
-        evaluation_summary_path = Path(evaluation_summary_text).expanduser()
-
     match_image_focus = _render_matching_panel(
         patient_id=patient_id,
-        results_path=Path(match_results_text).expanduser(),
-        feature_path=Path(aligned_features_text).expanduser(),
-        matrix_dir=Path(cost_matrix_dir_text).expanduser(),
-        pair_cost_path=Path(pair_costs_text).expanduser(),
-        evaluation_details_path=evaluation_details_path,
-        evaluation_summary_path=evaluation_summary_path,
+        manifest_path=manifest_path,
+        data_root=data_root,
+        paths=paths,
         run_matching=run_matching,
+        run_evaluation=run_evaluation,
         config=MatcherConfig(
             disappearing_penalty=float(disappearing_penalty),
             new_lesion_penalty=float(new_lesion_penalty),

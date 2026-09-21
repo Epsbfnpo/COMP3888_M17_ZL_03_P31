@@ -1,323 +1,278 @@
-# COMP3888_M17_ZL_03_P31
+# Longitudinal Review Station
 
-P31 longitudinal PET/CT lesion quantification project.
+## Quick Start with Makefile
 
-## Cohort A subset manifest
+Run all commands from the project root.
 
-This repository includes tooling to prepare a small Cohort A patient subset for
-pipeline development without requiring the full dataset. The manifest records
-baseline and follow-up scans separately, including CT, PET, lesion-mask, and
-available expert-reference paths, while explicitly flagging missing files.
+### 1. Prepare the raw data
 
-## Environment setup
+Place the Cohort A dataset under `./data`:
 
-On Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+```text
+data/
+├── inputsTr/
+└── targetsTr/        # or outputsTr/
 ```
 
-On macOS/Linux:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-## Makefile commands
-
-Run these commands from root with GNU Make installed (on Windows,
-use WSL or a shell with GNU Make). Activate python virtual environment first
-which shown above. `make setup` installs dependencies into the selected interpreter.
+### 2. Install dependencies
 
 ```bash
 make setup
-make manifest DATA="/path/to/cohort_a"
-make lesions DATA="/path/to/cohort_a"
-make pipeline DATA="/path/to/cohort_a"
+```
+
+### 3. Build the patient manifest and start the dashboard
+
+```bash
+make run
+```
+
+This command:
+
+1. discovers patients from `./data`;
+2. generates the scan and BL/FU pair manifests;
+3. starts the V5 Streamlit dashboard on port `8501`.
+
+Open the local URL printed by Streamlit, normally:
+
+```text
+http://localhost:8501
+```
+
+### Useful Makefile commands
+
+```bash
+make run MAX_PATIENTS=5
+```
+
+Runs the dashboard with the first five discovered patients.
+
+```bash
+make run PATIENT_IDS=006f52e910,02522a2b27
+```
+
+Builds the manifest for the specified patients only. `PATIENT_IDS` takes priority over `MAX_PATIENTS`.
+
+```bash
+make run DATA="C:/path/to/Longitudinal_CT_v2"
+```
+
+Uses a dataset outside the default `./data` directory.
+
+```bash
+make run PORT=8502
+```
+
+Starts Streamlit on a different port.
+
+```bash
+make manifest
+```
+
+Rebuilds the patient and BL/FU pair manifests without starting Streamlit.
+
+```bash
+make dashboard
+```
+
+Starts the dashboard using the existing pair manifest.
+
+```bash
 make test
 ```
 
-`manifest` selects first 5 patients and writes the cohort A manifests.
-`lesions` uses the existing pair manifest and exports 1 BL/FU lesion CSV per
-patient to `outputs/cohort_a_lesions/<patient_id>.csv`. It stops on extraction
-failure. `pipeline` generates manifest before extracting lesions, including
-when invoked with `make -j`. Running `make` alone runs `pipeline`.
+Runs the project test suite.
 
-`DATA` defaults to `COHORT_A_ROOT` when set, otherwise `data/cohort_a`.
-Both manifest generation and extraction use same root. Override
-`PYTHON` (default `python3`) to choose an interpreter, for example
-`make setup PYTHON=python`. Other overrides are `MAX_PATIENTS` (default `5`),
-`OUT_DIR` (default `outputs/cohort_a_subset`), `PAIRS` (default
-`$(OUT_DIR)/cohort_a_subset_pairs.csv`), and `LESIONS_DIR` (default
-`outputs/cohort_a_lesions`). For `pipeline`, keep `PAIRS` at its default so
-extraction uses the new generated manifest.
+Press `Ctrl+C` in the terminal to stop the dashboard.
 
-```bash
-make pipeline DATA="/path with spaces/cohort_a" MAX_PATIENTS=2
-```
+## Software Overview
 
-## Generate the manifest
+The Longitudinal Review Station is a Streamlit application for reviewing and matching lesions between baseline (BL) and follow-up (FU) Cohort A scans.
 
-Place or mount the Cohort A subset anywhere on your local machine. The script
-supports Cohort A folders with `inputsTr/` plus either `targetsTr/` or
-`outputsTr/` masks. The data folder is local/private and is ignored by Git.
+The software provides the following functions:
 
-Pass the dataset path at runtime:
+- automatic discovery of Cohort A patients and BL/FU scan pairs;
+- loading of CT, PET and lesion-mask data;
+- rigid longitudinal registration with ITKElastix;
+- synchronized review of original BL, aligned BL and original FU images;
+- optional lesion-mask overlays;
+- extraction of individual lesion components and quantitative features;
+- automatic generation of a lesion-pair cost matrix;
+- lesion correspondence calculation using NetworkX minimum-cost flow;
+- visualization and export of patient-level matching results;
+- optional comparison with reference tracking data when ground truth is available.
 
-```powershell
-python tools/prepare_cohort_a_subset.py `
-  --root "D:\path\to\cohort_a" `
-  --out-dir outputs/cohort_a_subset `
-  --max-patients 5
-```
-
-Alternatively, set `COHORT_A_ROOT` once per environment:
-
-```powershell
-$env:COHORT_A_ROOT = "D:\path\to\cohort_a"
-python tools/prepare_cohort_a_subset.py `
-  --out-dir outputs/cohort_a_subset `
-  --max-patients 5
-```
-
-By default, CSV paths are written relative to `--root`, so the manifest stays
-portable across cloned environments that keep the same dataset layout.
-
-To create a copied portable subset beside the manifest:
-
-```powershell
-python tools/prepare_cohort_a_subset.py `
-  --root "D:\path\to\cohort_a" `
-  --out-dir outputs/cohort_a_subset `
-  --max-patients 5 `
-  --copy-files `
-  --path-mode relative-to-manifest
-```
-
-## Load the manifest
-
-```python
-import pandas as pd
-
-scan_manifest = pd.read_csv("outputs/cohort_a_subset/cohort_a_subset_manifest.csv")
-pair_manifest = pd.read_csv("outputs/cohort_a_subset/cohort_a_subset_pairs.csv")
-```
-
-## Cohort A PET/CT loading and lesion extraction
-
-This implementation covers load baseline and follow-up PET/CT volumes and load lesion masks and extract individual lesions
- 
-
-The code consumes the wide-form `cohort_a_subset_pairs.csv` generated by
-`tools/prepare_cohort_a_subset.py`. This keeps the modules decoupled from the raw
-folder discovery logic: The manifest determines which files belong to the patient,
-These modules determine how to load and process these files.
-
-## Files
-
-- `src/cohort_a_loading.py` — manifest-aware NIfTI loading and metadata access.
-- `src/lesion_components.py` — mask validation and 3-D connected-component extraction.
-- `tools/inspect_cohort_a_patient.py` — CLI to inspect BL/FU CT/PET metadata.
-- `tools/extract_cohort_a_lesions.py` — CLI to report and export BL/FU lesions.
-- `test/demo_loading_and_lesions.py` — self-contained two-patient demonstration.
-- `tests/test_loading_and_lesions.py` — acceptance-oriented automated tests.
-
-## 1. Load baseline and follow-up PET/CT volumes
-
-`load_patient_pair()` reads one patient from the pair manifest and can load any combination of ct, pet, and lesion_mask.
-
-```python
-from src.cohort_a_loading import load_patient_pair
-
-pair = load_patient_pair(
-    "outputs/cohort_a_subset/cohort_a_subset_pairs.csv",
-    "0a09c8844b",
-    data_root="data/cohort_a",
-    modalities=("ct", "pet"),
-)
-
-print(pair.baseline.ct.metadata.shape)
-print(pair.baseline.ct.metadata.spacing_mm)
-print(pair.baseline.ct.metadata.affine)
-print(pair.baseline.ct.metadata.orientation)
-```
-
-Available metadata includes:
-
-- full NIfTI image shape/dimensions;
-- voxel spacing in millimetres;
-- 4×4 affine matrix;
-- orientation axis codes (for example `R`, `A`, `S`);
-- stored data type;
-- resolved source path.
-
-### Path resolution
-
-The previous manifest story supports several path modes. The loader handles:
-
-- absolute paths directly;
-- paths relative to the manifest directory;
-- paths relative to the Cohort A dataset root when `data_root=...` is supplied.
-
-The manifest may point to lesion masks under `inputsTr/`, `targetsTr/`, or the newly supported `outputsTr/`; the loader does not hard-code the mask folder and therefore follows whichever path the manifest records.
-
-For the default manifest mode (`relative-to-root`), pass the same Cohort A root
-used when the manifest was generated, or reuse the manifest tool's `COHORT_A_ROOT` environment variable.
-
-### Missing and unreadable files
-
-Requested modalities are strict by default. A blank or missing path raises
-`MissingImagingFileError`, while a corrupt or unreadable NIfTI raises
-`UnreadableImagingFileError`. Error messages include patient, timepoint and
-modality context.
-
-For inspection only, `allow_missing=True` returns missing requested modalities as
-`None` instead of stopping at the first missing file.
-
-Example CLI:
-
-```powershell
-python tools/inspect_cohort_a_patient.py `
-  --pairs outputs/cohort_a_subset/cohort_a_subset_pairs.csv `
-  --patient-id 0a09c8844b `
-  --data-root data/cohort_a
-```
-
-If the current local Cohort A sample is CT-only, use `--allow-missing` to inspect
-CT metadata while still seeing PET as unavailable:
-
-```powershell
-python tools/inspect_cohort_a_patient.py `
-  --pairs outputs/cohort_a_subset/cohort_a_subset_pairs.csv `
-  --patient-id 0a09c8844b `
-  --data-root data/cohort_a `
-  --allow-missing
-```
-
-This does not pretend that PET is present; strict loading still fails clearly
-when PET is requested but missing.
-
-## 2. Load masks and extract individual lesions
-
-Lesion masks are loaded without converting their stored labels to floating-point
-intensity data. `extract_individual_lesions()` then:
-
-1. verifies that the mask is a finite, non-negative, 3-D segmentation;
-2. rejects empty masks;
-3. rejects non-integer probability-like masks;
-4. splits positive source labels into 3-D connected components;
-5. assigns temporary IDs such as `patient123_BL_L001`;
-6. reports lesion count, voxel count, physical volume, voxel centroid and world-mm centroid.
-
-The default is 18-connectivity, matching the connectivity convention already
-used by the Stage 14 prototype. `6` and `26` can also be selected explicitly.
-
-Multi-label masks are handled conservatively: each positive source label is split
-independently into connected components. This prevents two touching lesions with
-different source labels from being accidentally merged.
-
-Example:
-
-```python
-from src.cohort_a_loading import load_patient_pair
-from src.lesion_components import extract_individual_lesions
-
-pair = load_patient_pair(
-    "outputs/cohort_a_subset/cohort_a_subset_pairs.csv",
-    "0a09c8844b",
-    data_root="data/cohort_a",
-    modalities=("lesion_mask",),
-)
-
-bl = extract_individual_lesions(
-    pair.baseline.lesion_mask,
-    patient_id=pair.patient_id,
-    timepoint="BL",
-)
-fu = extract_individual_lesions(
-    pair.followup.lesion_mask,
-    patient_id=pair.patient_id,
-    timepoint="FU",
-)
-
-print("BL lesions:", bl.lesion_count)
-print("FU lesions:", fu.lesion_count)
-```
-
-CLI export:
-
-```powershell
-python tools/extract_cohort_a_lesions.py `
-  --pairs outputs/cohort_a_subset/cohort_a_subset_pairs.csv `
-  --patient-id 0a09c8844b `
-  --data-root data/cohort_a `
-  --out outputs/cohort_a_lesions.csv
-```
-
-The CSV is intentionally lesion-level and contains temporary IDs only. These IDs
-are local working identifiers, not claims of BL↔FU correspondence. A later
-matching story can consume these lesion records.
-
-## Demonstration on multiple patients
-
-The repository data should stay private and is not committed, so a reproducible
-synthetic demonstration is included. It generates two small patients, each with
-BL/FU CT, PET and masks, then exercises both stories end-to-end:
-
-```powershell
-python tests/demo_loading_and_lesions.py
-```
-
-Expected summary:
+The main processing flow is:
 
 ```text
-demo_patient_01: ... lesions BL=2, FU=2
-demo_patient_02: ... lesions BL=2, FU=3
+Raw Cohort A data
+        ↓
+Patient and BL/FU pair manifest
+        ↓
+Rigid BL-to-FU registration
+        ↓
+Aligned lesion extraction and features
+        ↓
+Pairwise cost matrix
+        ↓
+Minimum-cost-flow matching
+        ↓
+Dashboard review and exported results
 ```
 
-The same requirements are covered by automated tests:
+## Project Inputs and Outputs
 
-```powershell
-python -m pytest -q
+### Input data
+
+By default, the application reads raw data from:
+
+```text
+./data
 ```
 
-## Dashboard lesion correspondence
+The pair manifest is generated at:
 
-The Streamlit multiplanar viewer can load saved min-cost-flow results, run
-matching for the currently selected patient directly from its labelled cost
-matrix, and select a correspondence to locate its BL/FU lesion centroids on
-the registered scans:
-
-```powershell
-streamlit run tools/align_longitudinal_patient_v4_mapped.py
+```text
+outputs/cohort_a_subset/cohort_a_subset_pairs.csv
 ```
 
-See `docs/dashboard_lesion_matching.md` for inputs, output behaviour, and error
-handling.
+Paths written into the manifest are resolved relative to the selected data root. If the data root is changed through `DATA=...`, the Makefile passes the same location to the dashboard automatically.
 
-## Acceptance-criteria mapping
+### Generated outputs
 
-### Load baseline and follow-up PET/CT volumes
+Patient-specific artifacts are stored under:
 
-- Baseline CT — `load_patient_pair(..., modalities=("ct", ...))`
-- Baseline PET — same loader via the BL manifest path
-- Follow-up CT — same loader via the FU manifest path
-- Follow-up PET — same loader via the FU manifest path
-- Dimensions, spacing, affine/orientation — `LoadedVolume.metadata`
-- Missing/unreadable files — explicit typed exceptions with contextual messages
-- Multiple sample patients — two-patient demo plus automated test coverage
+```text
+outputs/patients/<patient_id>/
+```
 
-### Load lesion masks and extract individual lesions
+Depending on the completed steps, this directory may contain registration results, aligned masks, lesion features, the cost matrix and final lesion matches. Existing valid artifacts are reused so that the same patient does not need to be processed again unnecessarily.
 
-- BL lesion mask — manifest-aware loader
-- FU lesion mask — manifest-aware loader
-- Connected lesion components — `scipy.ndimage.label`
-- Temporary unique ID — `<patient>_<BL/FU>_L###`
-- BL/FU lesion counts — `LesionExtractionResult.lesion_count`
-- Empty/invalid masks — explicit `EmptyLesionMaskError` / `LesionMaskError`
+## Dashboard Usage
+
+### 1. Select a patient
+
+Use the patient selector in the sidebar. The available patients come from the generated pair manifest.
+
+The V5 dashboard automatically uses the paths supplied by the Makefile. Under normal use, you do not need to enter separate manifest, output or cost-matrix paths.
+
+### 2. Review the BL and FU scans
+
+The alignment area presents three related views:
+
+- **Original BL**: the baseline image in its native space;
+- **Aligned BL**: the baseline image rigidly resampled into the FU space;
+- **Original FU**: the follow-up image used as the registration reference.
+
+Use the slice control or mouse wheel, where supported, to move through the scan. The displayed BL slice is mapped to the corresponding FU location so that the three views can be compared consistently.
+
+### 3. Display lesion masks
+
+Enable the mask option to overlay lesion regions on the images. The left view uses the native BL mask, the centre view uses the aligned BL mask, and the right view uses the FU mask.
+
+Mask overlays are intended to help verify:
+
+- whether lesions were extracted correctly;
+- whether BL and FU anatomy is sufficiently aligned;
+- whether a predicted lesion correspondence is visually plausible.
+
+### 4. Run or reuse alignment
+
+For a patient without processed outputs, start the alignment action shown in the dashboard. The application performs rigid BL-to-FU registration and saves the patient-specific result.
+
+If valid registration outputs already exist, the dashboard reuses them. Use the rerun option only when the source data, registration settings or previous result has changed.
+
+### 5. Generate lesion matching
+
+Open the matching section below the alignment review and run matching for the selected patient.
+
+The dashboard automatically:
+
+1. loads or generates the aligned lesion features;
+2. calculates pairwise distance and size-difference costs;
+3. generates the cost matrix for the selected patient;
+4. runs the NetworkX minimum-cost-flow solver;
+5. decodes and displays the predicted lesion correspondences.
+
+No pre-generated matrix path is required. Each matrix is associated with the selected patient and stored in that patient's output directory.
+
+### 6. Interpret matching results
+
+The result table links BL lesion IDs with FU lesion IDs and reports the matching information used by the algorithm. Lesion IDs are assigned during connected-component extraction and remain patient-specific.
+
+Review the table together with the image overlays. A low mathematical cost does not by itself guarantee a clinically correct correspondence, especially when registration is poor, a lesion was not extracted, or several lesions are close together.
+
+When split handling is enabled, one BL lesion may occupy more than one matching slot so that it can be associated with multiple FU lesions. Merge events remain distinguishable for later review and refinement.
+
+### 7. Review evaluation results
+
+When compatible ground-truth tracking data are available, the evaluation area can compare predictions with the reference correspondences.
+
+- **Correct**: the predicted correspondence agrees with the reference.
+- **Incorrect**: a correspondence was predicted, but it links the wrong lesions.
+- **Missed**: a reference correspondence was not recovered. This can also occur when a ground-truth lesion was not extracted and therefore never entered the matching graph.
+
+Use these metrics together with patient-level visual inspection. Registration and lesion-extraction failures should be investigated separately from matching-algorithm errors.
+
+## Recommended Review Order
+
+For each patient:
+
+1. confirm that the BL and FU scans load successfully;
+2. inspect the rigid alignment at several anatomical levels;
+3. enable masks and check that expected lesions are present;
+4. run lesion matching;
+5. review the predicted BL/FU links visually;
+6. inspect evaluation results if reference data are available;
+7. record registration, extraction or matching issues separately.
+
+## Troubleshooting
+
+### `data root does not exist`
+
+Confirm that the dataset is stored under `./data`, or provide its location explicitly:
+
+```bash
+make run DATA="C:/full/path/to/Longitudinal_CT_v2"
+```
+
+### `expected raw Cohort A data under .../inputsTr`
+
+The selected `DATA` directory must contain the `inputsTr` folder. Do not point `DATA` directly to `inputsTr`.
+
+### Missing Python packages
+
+Run:
+
+```bash
+make setup
+```
+
+Then start the application again with `make run`.
+
+### Rows with missing files
+
+This message means that one or more CT, PET, mask or reference paths could not be found while building the manifest. Check the dataset directory structure and file naming before processing the affected patients.
+
+### Port already in use
+
+Choose another port:
+
+```bash
+make run PORT=8502
+```
+
+### Dashboard starts but contains no patients
+
+Rebuild the manifest and confirm that the selected data root contains valid Cohort A cases:
+
+```bash
+make manifest DATA="C:/full/path/to/Longitudinal_CT_v2"
+make dashboard DATA="C:/full/path/to/Longitudinal_CT_v2"
+```
+
+## Notes
+
+- Run Make from the project root so that relative paths resolve correctly.
+- Use forward slashes in Windows command-line paths when possible.
+- Generated outputs are patient-specific and should remain under the configured patient output root.
+- The dashboard is a research prototype and its predicted correspondences require visual validation.

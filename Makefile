@@ -1,35 +1,37 @@
-PYTHON ?= python3
-DATA ?= $(if $(COHORT_A_ROOT),$(COHORT_A_ROOT),data/cohort_a)
+PYTHON ?= python
+DATA ?= ./data
+MAX_PATIENTS ?= 999999
+PATIENT_IDS ?=
 OUT_DIR ?= outputs/cohort_a_subset
-MAX_PATIENTS ?= 5
-PAIRS ?= $(OUT_DIR)/cohort_a_subset_pairs.csv
-LESIONS_DIR ?= outputs/cohort_a_lesions
+PATIENT_OUTPUT_ROOT ?= outputs/patients
+DASHBOARD ?= tools/align_longitudinal_patient_v5_mapped.py
+PORT ?= 8501
 
-.PHONY: setup manifest lesions pipeline test
-.DEFAULT_GOAL := pipeline
+PAIRS := $(OUT_DIR)/cohort_a_subset_pairs.csv
 
+export DATA_ROOT := $(DATA)
+export P31_PAIR_MANIFEST := $(PAIRS)
+export P31_PATIENT_OUTPUT_ROOT := $(PATIENT_OUTPUT_ROOT)
+
+MANIFEST_ARGS := --max-patients "$(MAX_PATIENTS)"
+ifneq ($(strip $(PATIENT_IDS)),)
+MANIFEST_ARGS := --patient-ids "$(PATIENT_IDS)"
+endif
+
+.PHONY: setup manifest dashboard run test
+.DEFAULT_GOAL := run
 
 setup:
 	"$(PYTHON)" -m pip install -r requirements.txt
 
 manifest:
-	"$(PYTHON)" tools/prepare_cohort_a_subset.py --root "$(DATA)" --out-dir "$(OUT_DIR)" --max-patients "$(MAX_PATIENTS)"
+	"$(PYTHON)" tools/prepare_cohort_a_subset.py --root "$(DATA)" --out-dir "$(OUT_DIR)" $(MANIFEST_ARGS) --path-mode relative-to-root
 
+dashboard:
+	"$(PYTHON)" -m streamlit run "$(DASHBOARD)" --server.port "$(PORT)"
 
-
-#run the existing extraction CLI for each patient in pair manifest
-lesions:
-	"$(PYTHON)" -c 'import csv, pathlib, subprocess, sys; \
-		rows = list(csv.DictReader(pathlib.Path(sys.argv[1]).open(newline="", encoding="utf-8"))); \
-		rows or sys.exit("No patients found in pair manifest"); \
-		[subprocess.run([sys.executable, "tools/extract_cohort_a_lesions.py", "--pairs", sys.argv[1], "--data-root", sys.argv[2], "--patient-id", row["patient_id"], "--out", str(pathlib.Path(sys.argv[3]) / (row["patient_id"] + ".csv"))], check=True) for row in rows]' "$(PAIRS)" "$(DATA)" "$(LESIONS_DIR)"
-
-
-
-
-#recursive make preserves variable overrides and order even with make -j
-pipeline: manifest
-	$(MAKE) lesions
+run: manifest
+	"$(PYTHON)" -m streamlit run "$(DASHBOARD)" --server.port "$(PORT)"
 
 test:
 	"$(PYTHON)" -m pytest -q
