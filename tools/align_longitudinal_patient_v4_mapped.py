@@ -20,7 +20,16 @@ from src.cohort_a_loading import (  # noqa: E402
     load_pair_manifest,
     load_patient_pair,
 )
-from src.registration import RegistrationError, register_patient_ct  # noqa: E402
+from src.registration import (  # noqa: E402
+    RegistrationError,
+    register_patient_ct,
+    warp_baseline_mask_to_fu,
+    warp_baseline_pet_to_fu,
+)
+from src.registration_mapping import (  # noqa: E402
+    fu_to_bl_slice_map,
+    mapped_native_bl_slice,
+)
 from src.correspondence_visualization import OUTCOME_STYLES, selected_lesion_mask, lesion_display_slice
 from src.lesion_min_cost_flow import MatcherConfig  # noqa: E402
 from src.matching_dashboard import (  # noqa: E402
@@ -57,7 +66,7 @@ DEFAULT_COST_MATRIX_DIR = "outputs/tracking_pipeline_11/lesion_pair_cost_matrice
 DEFAULT_PAIR_COSTS = "outputs/tracking_pipeline_11/lesion_pair_costs.csv"
 DEFAULT_EVALUATION_DETAILS = "outputs/tracking_evaluation_15/lesion_tracking_details.csv"
 DEFAULT_EVALUATION_SUMMARY = "outputs/tracking_evaluation_15/lesion_tracking_summary.csv"
-APP_VERSION = "V4.7 · Fast NIfTI slicing + tracking summary"
+APP_VERSION = "V4.9 · Modular registration transforms"
 
 # Three panels are displayed side-by-side, so rendering 900 px intermediates is
 # unnecessary and expensive during slider interaction. The environment variable
@@ -171,141 +180,6 @@ def _validate_image_mask_geometry(
         atol=1e-3,
     ):
         raise ValueError(f"{label} CT/mask affine geometry does not match.")
-
-def _registered_mask_needs_update(
-    registered_mask_path: Path,
-    baseline_mask_path: Path,
-    transform_path: Path,
-) -> bool:
-    if not registered_mask_path.exists():
-        return True
-    try:
-        output_time = registered_mask_path.stat().st_mtime_ns
-        return (
-            baseline_mask_path.stat().st_mtime_ns > output_time
-            or transform_path.stat().st_mtime_ns > output_time
-        )
-    except OSError:
-        return True
-
-def _warp_baseline_mask_to_fu(
-    baseline_mask: LoadedVolume,
-    *,
-    transform_path: Path,
-    registered_mask_path: Path,
-) -> Path:
-    #apply the saved BL-to-FU transform with nearest-neighbour interpolation to preserve mask labels
-    if not transform_path.exists():
-        raise FileNotFoundError(
-            f"Rigid transform not found: {transform_path}"
-        )
-    registered_mask_path.parent.mkdir(parents=True, exist_ok=True)
-    if not _registered_mask_needs_update(
-        registered_mask_path,
-        baseline_mask.metadata.path,
-        transform_path,
-    ):
-        return registered_mask_path
-    try:
-        import itk
-    except ImportError as exc:
-        raise RuntimeError(
-            "ITKElastix is required to transform lesion masks."
-        ) from exc
-    parameter_object = itk.ParameterObject.New()
-    parameter_object.AddParameterFile(str(transform_path))
-    #preserve label semantics.
-    parameter_object.SetParameter(
-        0,
-        "ResampleInterpolator",
-        "FinalNearestNeighborInterpolator",
-    )
-    parameter_object.SetParameter(
-        0,
-        "FinalBSplineInterpolationOrder",
-        "0",
-    )
-    parameter_object.SetParameter(
-        0,
-        "DefaultPixelValue",
-        "0",
-    )
-    moving_mask = itk.imread(
-        str(baseline_mask.metadata.path),
-        itk.US,
-    )
-    transformix = itk.TransformixFilter.New(moving_mask)
-    transformix.SetTransformParameterObject(parameter_object)
-    transformix.SetLogToConsole(False)
-    if hasattr(transformix, "SetLogToFile"):
-        transformix.SetLogToFile(False)
-    transformix.UpdateLargestPossibleRegion()
-    result_mask = transformix.GetOutput()
-    itk.imwrite(result_mask, str(registered_mask_path))
-    return registered_mask_path
-
-def _registered_pet_needs_update(
-    registered_pet_path: Path,
-    baseline_pet_path: Path,
-    transform_path: Path,
-) -> bool:
-    if not registered_pet_path.exists():
-        return True
-    try:
-        output_time = registered_pet_path.stat().st_mtime_ns
-        return (
-            baseline_pet_path.stat().st_mtime_ns > output_time
-            or transform_path.stat().st_mtime_ns > output_time
-        )
-    except OSError:
-        return True
-
-def _warp_baseline_pet_to_fu(
-    baseline_pet: LoadedVolume,
-    *,
-    transform_path: Path,
-    registered_pet_path: Path,
-) -> Path:
-    #apply the saved BL-to-FU transform to PET with linear interpolation
-    if not transform_path.exists():
-        raise FileNotFoundError(f"Rigid transform not found: {transform_path}")
-    registered_pet_path.parent.mkdir(parents=True, exist_ok=True)
-    if not _registered_pet_needs_update(
-        registered_pet_path,
-        baseline_pet.metadata.path,
-        transform_path,
-    ):
-        return registered_pet_path
-    try:
-        import itk
-    except ImportError as exc:
-        raise RuntimeError(
-            "ITKElastix is required to transform baseline PET into FU space."
-        ) from exc
-    parameter_object = itk.ParameterObject.New()
-    parameter_object.AddParameterFile(str(transform_path))
-    #use linear interpolation for continuous PET intensities
-    parameter_object.SetParameter(
-        0,
-        "ResampleInterpolator",
-        "FinalBSplineInterpolator",
-    )
-    parameter_object.SetParameter(
-        0,
-        "FinalBSplineInterpolationOrder",
-        "1",
-    )
-    parameter_object.SetParameter(0, "DefaultPixelValue", "0")
-    parameter_object.SetParameter(0, "ResultImagePixelType", "float")
-    moving_pet = itk.imread(str(baseline_pet.metadata.path), itk.F)
-    transformix = itk.TransformixFilter.New(moving_pet)
-    transformix.SetTransformParameterObject(parameter_object)
-    transformix.SetLogToConsole(False)
-    if hasattr(transformix, "SetLogToFile"):
-        transformix.SetLogToFile(False)
-    transformix.UpdateLargestPossibleRegion()
-    itk.imwrite(transformix.GetOutput(), str(registered_pet_path))
-    return registered_pet_path
 
 def _overlay_mask(
     grayscale: np.ndarray,
@@ -1337,187 +1211,6 @@ def _uint8_slice(
     #extract a normalised slice in the selected anatomical plane
     return extract_display_slice(volume, axis=axis, index=index)
 
-def _ras_to_lps(point_xyz: np.ndarray) -> np.ndarray:
-    #convert NIfTI RAS coordinates to ITK/Elastix LPS coordinates
-    point = np.asarray(point_xyz, dtype=float)
-    return np.asarray([-point[0], -point[1], point[2]], dtype=float)
-
-def _lps_to_ras(point_xyz: np.ndarray) -> np.ndarray:
-    #convert ITK/Elastix LPS coordinates to NIfTI RAS coordinates
-    point = np.asarray(point_xyz, dtype=float)
-    return np.asarray([-point[0], -point[1], point[2]], dtype=float)
-
-def _parameter_value(
-    parameter_map,
-    name: str,
-    *,
-    default: tuple[str, ...] | None = None,
-) -> tuple[str, ...]:
-    try:
-        values = parameter_map[name]
-    except Exception:
-        if default is not None:
-            return default
-        raise ValueError(
-            f"Rigid transform parameter '{name}' is missing."
-        )
-    return tuple(str(value) for value in values)
-
-def _build_elastix_euler_transform(transform_path: str):
-    #rebuild the Elastix Euler transform from fixed FU to moving native BL, no inversion is needed
-    try:
-        import itk
-    except ImportError as exc:
-        raise RuntimeError(
-            "ITKElastix is required to map FU positions back to Original BL."
-        ) from exc
-    parameter_object = itk.ParameterObject.New()
-    parameter_object.AddParameterFile(str(transform_path))
-    parameter_map = parameter_object.GetParameterMap(0)
-    transform_name = _parameter_value(
-        parameter_map,
-        "Transform",
-    )[0].strip('"')
-
-    if transform_name != "EulerTransform":
-        raise ValueError(
-            "Original-BL slice mapping currently supports only the rigid "
-            f"EulerTransform, but the saved transform is {transform_name!r}."
-        )
-    initial = _parameter_value(
-        parameter_map,
-        "InitialTransformParameterFileName",
-        default=("NoInitialTransform",),
-    )[0].strip('"')
-    if initial not in {
-        "NoInitialTransform",
-        "NoInitialTransformParameterFileName",
-    }:
-        raise ValueError(
-            "The saved rigid transform references an additional initial "
-            "transform. This viewer intentionally refuses to ignore a transform "
-            f"chain: {initial}"
-        )
-    parameters = tuple(
-        float(value)
-        for value in _parameter_value(
-            parameter_map,
-            "TransformParameters",
-        )
-    )
-    if len(parameters) != 6:
-        raise ValueError(
-            "Expected six Euler rigid parameters "
-            "(rx, ry, rz, tx, ty, tz); "
-            f"found {len(parameters)}."
-        )
-    centre = tuple(
-        float(value)
-        for value in _parameter_value(
-            parameter_map,
-            "CenterOfRotationPoint",
-        )
-    )
-    if len(centre) != 3:
-        raise ValueError(
-            "Expected a 3-D CenterOfRotationPoint in the rigid transform."
-        )
-    compute_zyx_text = _parameter_value(
-        parameter_map,
-        "ComputeZYX",
-        default=("false",),
-    )[0].strip('"').lower()
-    compute_zyx = compute_zyx_text == "true"
-    rigid = itk.Euler3DTransform[itk.D].New()
-    rigid.SetCenter(centre)
-    rigid.SetComputeZYX(compute_zyx)
-    rigid.SetRotation(
-        parameters[0],
-        parameters[1],
-        parameters[2],
-    )
-    rigid.SetTranslation(
-        (
-            parameters[3],
-            parameters[4],
-            parameters[5],
-        )
-    )
-    return rigid
-
-@st.cache_data(show_spinner=False)
-def _fu_to_bl_slice_map(
-    *,
-    bl_shape: tuple[int, int, int],
-    bl_affine_flat: tuple[float, ...],
-    bl_orientation: tuple[str, str, str],
-    fu_shape: tuple[int, int, int],
-    fu_affine_flat: tuple[float, ...],
-    fu_orientation: tuple[str, str, str],
-    plane_name: str,
-    transform_path: str,
-    transform_modified_ns: int,
-) -> tuple[float, ...]:
-    #map each FU plane centre to the nearest native BL plane of the same orientation
-    #registered BL and FU share the FU grid and slice index
-    del transform_modified_ns  #cache invalidation only
-    bl_affine = np.asarray(bl_affine_flat, dtype=float).reshape(4, 4)
-    fu_affine = np.asarray(fu_affine_flat, dtype=float).reshape(4, 4)
-    bl_axis = anatomical_axis(bl_orientation, plane_name)
-    fu_axis = anatomical_axis(fu_orientation, plane_name)
-    try:
-        bl_affine_inv = np.linalg.inv(bl_affine)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError("Original BL affine is not invertible.") from exc
-    rigid = _build_elastix_euler_transform(transform_path)
-    mapped_axis: list[float] = []
-    centre = np.asarray([(size - 1) / 2.0 for size in fu_shape] + [1.0], dtype=float)
-    for slice_index in range(fu_shape[fu_axis]):
-        fu_voxel = centre.copy()
-        fu_voxel[fu_axis] = float(slice_index)
-        #nibabel gives RAS physical coordinates
-        fu_world_ras = (fu_affine @ fu_voxel)[:3]
-        fu_world_lps = _ras_to_lps(fu_world_ras)
-        #Elastix transform direction is fixed(FU) -> moving(BL)
-        bl_world_lps = np.asarray(
-            rigid.TransformPoint(tuple(float(v) for v in fu_world_lps)),
-            dtype=float,
-        )
-        bl_world_ras = _lps_to_ras(bl_world_lps)
-        bl_world_h = np.asarray(
-            [bl_world_ras[0], bl_world_ras[1], bl_world_ras[2], 1.0],
-            dtype=float,
-        )
-        bl_voxel = bl_affine_inv @ bl_world_h
-        mapped_axis.append(float(bl_voxel[bl_axis]))
-    return tuple(mapped_axis)
-
-def _mapped_native_bl_slice(
-    mapped_z_by_fu_slice: tuple[float, ...],
-    *,
-    fu_slice_index: int,
-    bl_slice_count: int,
-) -> tuple[int, float, bool]:
-    #find the nearest native BL axial slice using the saved transform, not raw-coordinate proximity
-    if not 0 <= fu_slice_index < len(mapped_z_by_fu_slice):
-        raise IndexError(
-            f"FU slice {fu_slice_index} is outside the precomputed mapping."
-        )
-    continuous_index = float(mapped_z_by_fu_slice[fu_slice_index])
-    last_index = bl_slice_count - 1
-    outside_fov = (
-        continuous_index < -0.5
-        or continuous_index > last_index + 0.5
-    )
-    index = int(
-        np.clip(
-            np.rint(continuous_index),
-            0,
-            last_index,
-        )
-    )
-    return index, continuous_index, outside_fov
-
 @st.fragment
 def _render_slice_viewer(
     original_display: np.ndarray,
@@ -1600,7 +1293,7 @@ def _render_slice_viewer(
         return cache_namespace + (int(index),)
 
     def _build_rendered_slice(index: int) -> dict[str, object]:
-        original_index, original_float_index, outside_fov = _mapped_native_bl_slice(
+        original_index, original_float_index, outside_fov = mapped_native_bl_slice(
             mapped_axis_by_fu_slice,
             fu_slice_index=int(index),
             bl_slice_count=bl_info.slice_count,
@@ -2040,7 +1733,7 @@ def main() -> None:
     transform_path = output_dir / "TransformParameters.0.txt"
     #build the native-BL mapping for the currently selected anatomical plane
     try:
-        mapped_axis_by_fu_slice = _fu_to_bl_slice_map(
+        mapped_axis_by_fu_slice = fu_to_bl_slice_map(
             bl_shape=tuple(int(v) for v in bl_ct.data.shape),
             bl_affine_flat=tuple(
                 float(v)
@@ -2079,7 +1772,7 @@ def main() -> None:
                 _validate_image_mask_geometry(fu_ct, fu_mask, label="Follow-up")
             if bl_mask is not None:
                 with st.spinner("Preparing rigidly transformed BL lesion mask..."):
-                    _warp_baseline_mask_to_fu(
+                    warp_baseline_mask_to_fu(
                         bl_mask,
                         transform_path=transform_path,
                         registered_mask_path=registered_mask_path,
@@ -2143,7 +1836,7 @@ def main() -> None:
                     role="follow-up PET on FU CT grid",
                 )
 
-                _warp_baseline_pet_to_fu(
+                warp_baseline_pet_to_fu(
                     bl_pet,
                     transform_path=transform_path,
                     registered_pet_path=registered_pet_path,
@@ -2241,7 +1934,7 @@ def main() -> None:
                 with st.spinner(
                     "Preparing registered BL lesion mask for matching visualisation..."
                 ):
-                    _warp_baseline_mask_to_fu(
+                    warp_baseline_mask_to_fu(
                         bl_mask,
                         transform_path=transform_path,
                         registered_mask_path=registered_mask_path,

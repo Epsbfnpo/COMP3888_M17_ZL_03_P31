@@ -178,6 +178,157 @@ def _remove_previous_outputs(output_dir: Path) -> None:
         log_path.unlink()
 
 
+def _transformed_output_needs_update(
+    output_path: Path,
+    source_path: Path,
+    transform_path: Path,
+) -> bool:
+    """Return whether a Transformix output is absent or older than an input."""
+    if not output_path.is_file():
+        return True
+
+    try:
+        output_modified_ns = output_path.stat().st_mtime_ns
+        return (
+            source_path.stat().st_mtime_ns > output_modified_ns
+            or transform_path.stat().st_mtime_ns > output_modified_ns
+        )
+    except OSError:
+        # Let the caller regenerate the output and report a useful transform
+        # error instead of treating an unreadable cache entry as valid.
+        return True
+
+
+def _transform_volume_to_followup(
+    source_volume: LoadedVolume,
+    *,
+    transform_path: str | Path,
+    output_path: str | Path,
+    source_pixel_kind: str,
+    interpolation_order: int,
+    result_pixel_type: str,
+    role: str,
+    force: bool = False,
+) -> Path:
+    """Apply a saved BL-to-FU Elastix transform to one source volume."""
+    transform = Path(transform_path).expanduser()
+    output = Path(output_path).expanduser()
+    source = Path(source_volume.metadata.path).expanduser()
+
+    if not source.is_file():
+        raise RegistrationError(f"{role} source file not found: {source}")
+    if not transform.is_file():
+        raise RegistrationError(f"Rigid transform not found: {transform}")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if not force and not _transformed_output_needs_update(
+        output,
+        source,
+        transform,
+    ):
+        return output
+
+    try:
+        import itk
+    except ImportError as exc:
+        raise RegistrationError(
+            f"ITKElastix is required to transform {role}."
+        ) from exc
+
+    if source_pixel_kind == "unsigned_short":
+        source_pixel_type = itk.US
+    elif source_pixel_kind == "float":
+        source_pixel_type = itk.F
+    else:
+        raise ValueError(
+            f"Unsupported Transformix source pixel kind: {source_pixel_kind!r}"
+        )
+
+    try:
+        parameter_object = itk.ParameterObject.New()
+        parameter_object.AddParameterFile(str(transform))
+        parameter_object.SetParameter(
+            0,
+            "ResampleInterpolator",
+            (
+                "FinalNearestNeighborInterpolator"
+                if interpolation_order == 0
+                else "FinalBSplineInterpolator"
+            ),
+        )
+        parameter_object.SetParameter(
+            0,
+            "FinalBSplineInterpolationOrder",
+            str(interpolation_order),
+        )
+        parameter_object.SetParameter(0, "DefaultPixelValue", "0")
+        parameter_object.SetParameter(
+            0,
+            "ResultImagePixelType",
+            result_pixel_type,
+        )
+
+        moving_image = itk.imread(str(source), source_pixel_type)
+        transformix = itk.TransformixFilter.New(moving_image)
+        transformix.SetTransformParameterObject(parameter_object)
+        transformix.SetLogToConsole(False)
+        if hasattr(transformix, "SetLogToFile"):
+            transformix.SetLogToFile(False)
+        transformix.UpdateLargestPossibleRegion()
+        itk.imwrite(transformix.GetOutput(), str(output))
+    except Exception as exc:
+        raise RegistrationError(
+            f"Could not transform {role} into FU space: {exc}"
+        ) from exc
+
+    if not output.is_file():
+        raise RegistrationError(
+            f"Transformix completed but did not write the expected {role} "
+            f"output: {output}"
+        )
+    return output
+
+
+def warp_baseline_mask_to_fu(
+    baseline_mask: LoadedVolume,
+    *,
+    transform_path: str | Path,
+    registered_mask_path: str | Path,
+    force: bool = False,
+) -> Path:
+    """Warp a BL label mask into FU space using nearest-neighbour sampling."""
+    return _transform_volume_to_followup(
+        baseline_mask,
+        transform_path=transform_path,
+        output_path=registered_mask_path,
+        source_pixel_kind="unsigned_short",
+        interpolation_order=0,
+        result_pixel_type="unsigned short",
+        role="baseline lesion mask",
+        force=force,
+    )
+
+
+def warp_baseline_pet_to_fu(
+    baseline_pet: LoadedVolume,
+    *,
+    transform_path: str | Path,
+    registered_pet_path: str | Path,
+    force: bool = False,
+) -> Path:
+    """Warp continuous BL PET intensities into FU space using linear sampling."""
+    return _transform_volume_to_followup(
+        baseline_pet,
+        transform_path=transform_path,
+        output_path=registered_pet_path,
+        source_pixel_kind="float",
+        interpolation_order=1,
+        result_pixel_type="float",
+        role="baseline PET",
+        force=force,
+    )
+
+
 def register_ct_pair(
     baseline_ct: LoadedVolume,
     followup_ct: LoadedVolume,
