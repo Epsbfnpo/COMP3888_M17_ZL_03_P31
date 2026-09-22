@@ -48,10 +48,10 @@ def test_outcomes_have_distinct_colours_and_explicit_labels():
     assert 'no BL' in OUTCOME_STYLES['NEW'][0]
     assert 'no FU' in OUTCOME_STYLES['DISAPPEARING'][0]
 
-@pytest.mark.parametrize('outcome,has_bl,has_fu', [('MATCHED', True, True), ('NEW', False, True), ('DISAPPEARING', True, False)])
+@pytest.mark.parametrize('outcome,has_bl,has_fu', [('MATCHED', True, True), ('MERGING', True, True), ('NEW', False, True), ('DISAPPEARING', True, False)])
 def test_focus_renders_masks_ids_and_missing_side(tmp_path, monkeypatch, outcome, has_bl, has_fu):
     from contextlib import nullcontext
-    from tools import align_longitudinal_patient_v4_mapped as dashboard
+    from tools import align_longitudinal_patient_v5_mapped as dashboard
     from src.matching_dashboard import MatchImageFocus
     data = np.zeros((8, 8, 8))
     data[2:5, 2:5, 2:5] = 1
