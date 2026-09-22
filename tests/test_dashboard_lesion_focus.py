@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tools.align_longitudinal_patient_v4_mapped import _centroid_marker_slice
+from tools.align_longitudinal_patient_v5_mapped import _centroid_marker_slice
 
 
 @pytest.mark.parametrize(
