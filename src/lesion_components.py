@@ -67,6 +67,9 @@ def validate_lesion_mask(mask: np.ndarray) -> np.ndarray:
             )
         data = rounded
 
+    if np.any(data > np.iinfo(np.int32).max):
+        raise LesionMaskError("Lesion mask labels exceed the supported int32 range.")
+
     labels = data.astype(np.int32, copy=False)
     if not np.any(labels > 0):
         raise EmptyLesionMaskError("Lesion mask is empty: no positive lesion voxels were found.")

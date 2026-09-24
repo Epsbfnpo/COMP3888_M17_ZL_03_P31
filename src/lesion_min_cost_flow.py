@@ -274,6 +274,8 @@ def load_patient_cost_matrix(
     if not str(cost_column).strip():
         raise LesionMinCostFlowError("cost_column must not be blank.")
 
+    if matrix["bl_lesion_id"].isna().any():
+        raise LesionMinCostFlowError("Cost matrix BL lesion IDs must not be blank.")
     bl_series = matrix["bl_lesion_id"].astype(str).str.strip()
     if (bl_series == "").any():
         raise LesionMinCostFlowError("Cost matrix BL lesion IDs must not be blank.")

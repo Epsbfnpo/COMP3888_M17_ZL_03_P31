@@ -127,6 +127,10 @@ def _normalise_feature_table(features: pd.DataFrame) -> pd.DataFrame:
         #preserve predictable dtypes/columns for downstream code
         return table
 
+    for column in ("patient_id", "lesion_id", "timepoint"):
+        if table[column].isna().any():
+            raise LesionPairCostError(f"{column} must not be blank.")
+
     table["patient_id"] = table["patient_id"].astype(str).str.strip()
     table["lesion_id"] = table["lesion_id"].astype(str).str.strip()
     table["timepoint"] = table["timepoint"].astype(str).str.strip().str.upper()
