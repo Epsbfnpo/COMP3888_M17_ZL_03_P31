@@ -18,7 +18,7 @@ ifneq ($(strip $(PATIENT_IDS)),)
 MANIFEST_ARGS := --patient-ids "$(PATIENT_IDS)"
 endif
 
-.PHONY: setup manifest dashboard run test test-p31-27 test-p31-29 test-p31-31 test-assigned
+.PHONY: setup manifest dashboard run test test-p31-27 test-p31-29 test-p31-31 test-p31-32 test-p31-33 test-p31-34 test-assigned
 .DEFAULT_GOAL := run
 
 setup:
@@ -51,3 +51,10 @@ test-assigned:
 		tests/test_p31_27_lesion_features_functional.py \
 		tests/test_p31_29_pair_cost_functional.py \
 		tests/test_p31_31_visualization_summary_functional.py
+
+test-p31-32:
+	"$(PYTHON)" -m pytest -q -rA tests/test_p31_32_dashboard_responsiveness.py
+test-p31-33:
+	"$(PYTHON)" -m pytest -q -rA tests/test_p31_33_pipeline_stability.py
+test-p31-34:
+	"$(PYTHON)" -m pytest -q tests/test_p31_34_robustness.py
