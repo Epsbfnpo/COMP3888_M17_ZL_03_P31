@@ -15,7 +15,7 @@ TEST_FILES := $(sort $(wildcard \
 	$(TEST_DIR)/test_p31_27*.py \
 	$(TEST_DIR)/test_p31_28*.py \
 	$(TEST_DIR)/test_p31_29*.py \
-	$(TEST_DIR)/*p31_30*.py \
+	$(TEST_DIR)/test_p31_30*.py \
 	$(TEST_DIR)/test_p31_31*.py \
 	$(TEST_DIR)/test_p31_32*.py \
 	$(TEST_DIR)/test_p31_33*.py \
