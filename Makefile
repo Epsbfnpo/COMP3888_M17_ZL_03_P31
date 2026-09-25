@@ -34,7 +34,7 @@ MANIFEST_ARGS := --patient-ids "$(PATIENT_IDS)"
 endif
 
 .PHONY: setup manifest dashboard run test test-coverage coverage show-tests \
-	test-p31-27 test-p31-29 test-p31-31 test-p31-32 test-p31-33 test-p31-34 test-assigned
+	test-p31-26 test-p31-27 test-p31-29 test-p31-31 test-p31-32 test-p31-33 test-p31-34 test-assigned
 .DEFAULT_GOAL := run
 
 setup:
@@ -63,6 +63,9 @@ test-coverage:
 
 coverage: test-coverage
 
+test-p31-26: manifest
+	P31_RUN_REAL_LOADING_TESTS=1 "$(PYTHON)" -m pytest -q $(TEST_DIR)/test_p31_26_patient_data_loading_functional.py
+
 test-p31-27:
 	"$(PYTHON)" -m pytest -q $(TEST_DIR)/test_p31_27_lesion_features_functional.py
 
@@ -74,6 +77,7 @@ test-p31-31:
 
 test-assigned:
 	"$(PYTHON)" -m pytest -q \
+		$(TEST_DIR)/test_p31_26_patient_data_loading_functional.py \
 		$(TEST_DIR)/test_p31_27_lesion_features_functional.py \
 		$(TEST_DIR)/test_p31_29_pair_cost_functional.py \
 		$(TEST_DIR)/test_p31_31_visualization_summary_functional.py
