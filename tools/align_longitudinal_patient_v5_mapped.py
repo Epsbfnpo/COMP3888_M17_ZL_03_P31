@@ -4,6 +4,8 @@ import os
 import subprocess
 import sys
 import time
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -1298,6 +1300,22 @@ def _registration_paths(
     registered_mask_path = output_dir / "registered_baseline_lesion_mask.nii.gz"
     return output_dir, registered_path, registered_mask_path
 
+def _write_registration_error_log(output_dir: Path, patient_id: str, exc: Exception) -> None:
+    """Append a failed run's exception to the patient's output log."""
+    try:
+        log_dir = PROJECT_ROOT / "outputs" / "errorlog" / str(patient_id)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with (log_dir / "registration_error.log").open("a", encoding="utf-8") as log:
+            log.write(f"\n{'=' * 72}\n")
+            log.write(f"Time (UTC): {datetime.now(timezone.utc).isoformat()}\n")
+            log.write(f"Patient: {patient_id}\n")
+            log.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            log.write("\n")
+    except OSError:
+        # Logging must not mask the original registration failure.
+        pass
+
+
 def _registration_is_ready(output_dir: Path, registered_path: Path) -> bool:
     #return the rigid-registration output paths used by the pipeline
     return (
@@ -1798,6 +1816,7 @@ def main() -> None:
     )
     st.title("Longitudinal BL → FU Multiplanar Viewer")
     st.caption(f"**{APP_VERSION}**")
+    registration_error_panel = st.empty()
     st.caption(
         "ITKElastix rigid-only registration with linked Axial / Coronal / "
         "Sagittal CT/PET viewing in FU space."
@@ -1866,6 +1885,15 @@ def main() -> None:
     with st.sidebar:
         patient_id = st.selectbox("Patient", options=patient_ids)
         paths = _patient_output_paths(output_root_text, patient_id)
+
+        # Display only errors already raised by the existing registration code.
+        registration_errors = st.session_state.setdefault("_registration_errors", {})
+        registration_error_key = (str(paths["registration_dir"]), str(patient_id))
+        if registration_error_key in registration_errors:
+            registration_error_panel.error(
+                f"Registration failed for patient {patient_id}:\n\n"
+                f"{registration_errors[registration_error_key]}"
+            )
 
         st.header("Alignment")
         st.write("Conservative baseline: **Rigid only**")
@@ -2015,11 +2043,15 @@ def main() -> None:
             _load_registered_pet_cached.clear()
             st.session_state.pop("_alignment_display_cache", None)
             st.session_state.pop("_p31_slice_render_cache", None)
+            registration_errors.pop(registration_error_key, None)
+            registration_error_panel.empty()
             st.success(f"Alignment completed: {registered_path}")
-        except RegistrationError as exc:
-            st.error(str(exc))
         except Exception as exc:
-            st.error(f"Unexpected registration failure: {exc}")
+            _write_registration_error_log(output_dir, patient_id, exc)
+            registration_errors[registration_error_key] = str(exc)
+            registration_error_panel.error(
+                f"Registration failed for patient {patient_id}:\n\n{exc}"
+            )
 
     # Matching/evaluation can be started directly from raw data.  If alignment
     # has not been run yet, aligned-feature generation performs and persists the
@@ -2041,7 +2073,11 @@ def main() -> None:
             _load_registered_mask_cached.clear()
             _load_registered_pet_cached.clear()
         except Exception as exc:
-            st.error(f"Could not prepare matching inputs: {exc}")
+            _write_registration_error_log(output_dir, patient_id, exc)
+            registration_errors[registration_error_key] = str(exc)
+            registration_error_panel.error(
+                f"Could not prepare alignment/matching inputs for patient {patient_id}:\n\n{exc}"
+            )
 
     ready = _registration_is_ready(output_dir, registered_path)
     if not ready:

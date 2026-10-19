@@ -1,6 +1,6 @@
 PYTHON ?= python
 DATA ?= ./data
-MAX_PATIENTS ?= 999999
+MAX_PATIENTS ?= 99999
 PATIENT_IDS ?=
 OUT_DIR ?= outputs/cohort_a_subset
 PATIENT_OUTPUT_ROOT ?= outputs/patients
