@@ -70,7 +70,7 @@ from src.multiplanar_view import (  # noqa: E402
 DEFAULT_DATA_ROOT = "./data"
 DEFAULT_PAIRS = "outputs/cohort_a_subset/cohort_a_subset_pairs.csv"
 DEFAULT_PATIENT_OUTPUT_ROOT = "outputs/patients"
-APP_VERSION = "V5.0 · Patient-driven automatic pipeline"
+APP_VERSION = "V5.1 · Matching review layout"
 
 # Three panels are displayed side-by-side, so rendering 900 px intermediates is
 # unnecessary and expensive during slider interaction. The environment variable
@@ -667,6 +667,8 @@ def _render_matching_panel(
     run_matching: bool,
     run_evaluation: bool,
     config: MatcherConfig,
+    visualisation_container=None,
+    focus_renderer=None,
 ) -> MatchImageFocus | None:
     # Run/load matching, then expose the evidence required by Jira P31-21.
     results_path = paths["matches"]
@@ -674,8 +676,13 @@ def _render_matching_panel(
     pair_cost_path = paths["pair_costs"]
     evaluation_details_path = paths["evaluation_details"]
     evaluation_summary_path = paths["evaluation_summary"]
+    selected_visualisation = (
+        visualisation_container
+        if visualisation_container is not None
+        else st.container()
+    )
 
-    st.subheader("Lesion correspondence")
+    st.subheader("Patient matching overview")
     st.caption(
         "Automatic BL ↔ FU outcomes for the selected patient. Select an event "
         "to inspect lesion IDs, matcher features, cost/distance, unmatched status, "
@@ -730,17 +737,23 @@ def _render_matching_panel(
     try:
         matches = load_patient_matches(results_path, patient_id)
     except FileNotFoundError as exc:
-        st.info(
-            f"{exc} Run matching from the sidebar; the cost matrix will be "
-            "generated automatically for this patient."
-        )
+        with selected_visualisation:
+            st.markdown("#### Selected lesion correspondence")
+            st.info(
+                f"{exc} Run matching from the sidebar; the cost matrix will be "
+                "generated automatically for this patient."
+            )
         return None
     except MatchingDashboardError as exc:
-        st.warning(str(exc))
+        with selected_visualisation:
+            st.markdown("#### Selected lesion correspondence")
+            st.warning(str(exc))
         return None
 
     if matches.empty:
-        st.info("No lesion correspondence rows are available for this patient.")
+        with selected_visualisation:
+            st.markdown("#### Selected lesion correspondence")
+            st.info("No lesion correspondence rows are available for this patient.")
         return None
 
     # P31-22 patient-level summary. Structural counts always come from the
@@ -943,12 +956,13 @@ def _render_matching_panel(
     ]
     display_columns = [column for column in preferred_columns if column in display_matches]
 
-    st.dataframe(
-        display_matches[display_columns],
-        hide_index=True,
-        width="stretch",
-    )
-    st.caption(f"Matching results: {results_path}")
+    with st.expander(f"All matching events ({len(display_matches)})"):
+        st.dataframe(
+            display_matches[display_columns],
+            hide_index=True,
+            width="stretch",
+        )
+        st.caption(f"Matching results: {results_path}")
 
     def _match_option_label(index: int) -> str:
         row = matches.iloc[index]
@@ -956,140 +970,179 @@ def _render_matching_panel(
         fu_id = _normalise_optional_id(row.get("fu_lesion_id")) or "—"
         return f"{row['match_type']} · {bl_id} → {fu_id}"
 
-    selected_index = st.selectbox(
-        "Select lesion correspondence / unmatched event",
-        options=list(range(len(matches))),
-        format_func=_match_option_label,
-        key=f"selected_match_{patient_id}",
-    )
-
-    selected_match = matches.iloc[int(selected_index)]
-    bl_id = _normalise_optional_id(selected_match.get("bl_lesion_id"))
-    fu_id = _normalise_optional_id(selected_match.get("fu_lesion_id"))
-    match_type = str(selected_match.get("match_type", "")).upper()
-
-    # Load aligned features for selected-lesion details and image linking.
-    try:
-        features = load_patient_features(feature_path, patient_id)
-    except (FileNotFoundError, MatchingDashboardError) as exc:
-        st.warning(f"Matching results are available, but feature details are unavailable: {exc}")
-        features = pd.DataFrame()
-
-    bl_feature = _feature_row(features, timepoint="BL", lesion_id=bl_id)
-    fu_feature = _feature_row(features, timepoint="FU", lesion_id=fu_id)
-
-    # Pair-cost CSV contains the actual feature breakdown used to construct candidate edges.
-    try:
-        pair_costs = _patient_auxiliary_rows(pair_cost_path, patient_id)
-    except Exception as exc:
-        st.warning(f"Could not read pair-cost details: {exc}")
-        pair_costs = None
-
-    pair_cost_row = _event_row(
-        pair_costs,
-        bl_lesion_id=bl_id,
-        fu_lesion_id=fu_id,
-    )
-
-    st.markdown("#### Selected match details")
-    overview = st.columns(4)
-    overview[0].metric("BL lesion ID", bl_id or "—")
-    overview[1].metric("FU lesion ID", fu_id or "—")
-    overview[2].metric("Outcome", match_type or "—")
-    overview[3].metric(
-        "Match cost",
-        _format_metric_number(selected_match.get("match_cost"), digits=4),
-    )
-
-    if match_type == "DISAPPEARING":
-        st.warning(f"{bl_id or 'BL lesion'} has no FU correspondence and is labelled DISAPPEARING.")
-    elif match_type == "NEW":
-        st.warning(f"{fu_id or 'FU lesion'} has no BL correspondence and is labelled NEW.")
-
-    # Feature block: show exact pair-cost inputs when a BL↔FU candidate exists.
-    st.markdown("#### Matcher features and cost")
-
-    if pair_cost_row is not None:
-        feature_metrics = st.columns(4)
-        feature_metrics[0].metric(
-            "Distance",
-            _format_metric_number(pair_cost_row.get("distance_mm"), digits=2, suffix=" mm"),
+    # P31-36: keep the selected event, its aligned images, and the key matcher
+    # evidence together in the container anchored directly below the alignment viewer.
+    with selected_visualisation:
+        st.markdown("#### Selected lesion correspondence")
+        st.caption(
+            "Choose a predicted event to compare its aligned BL/FU lesion images "
+            "with the matcher features that produced the correspondence."
         )
-        feature_metrics[1].metric(
-            "BL volume",
-            _format_metric_number(pair_cost_row.get("bl_volume_ml"), digits=3, suffix=" mL"),
-        )
-        feature_metrics[2].metric(
-            "FU volume",
-            _format_metric_number(pair_cost_row.get("fu_volume_ml"), digits=3, suffix=" mL"),
-        )
-        size_fraction = _safe_float(pair_cost_row.get("size_difference_fraction"))
-        feature_metrics[3].metric(
-            "Size difference",
-            "—" if size_fraction is None else f"{100.0 * size_fraction:.1f}%",
+        selected_index = st.selectbox(
+            "Select lesion correspondence / unmatched event",
+            options=list(range(len(matches))),
+            format_func=_match_option_label,
+            key=f"selected_match_{patient_id}",
         )
 
-        cost_fields = [
-            "distance_cost",
-            "size_cost",
-            "pet_cost",
-            "total_cost",
-            "candidate_rank_for_bl",
-            "pet_feature",
-            "bl_pet_value",
-            "fu_pet_value",
-            "pet_difference_fraction",
-            "pet_used",
-        ]
-        available_cost_fields = [field for field in cost_fields if field in pair_cost_row.index]
-        if available_cost_fields:
-            detail_table = pd.DataFrame(
-                {
-                    "Field": available_cost_fields,
-                    "Value": [
-                        _arrow_safe_display_value(pair_cost_row.get(field))
-                        for field in available_cost_fields
-                    ],
-                }
+        selected_match = matches.iloc[int(selected_index)]
+        bl_id = _normalise_optional_id(selected_match.get("bl_lesion_id"))
+        fu_id = _normalise_optional_id(selected_match.get("fu_lesion_id"))
+        match_type = str(selected_match.get("match_type", "")).upper()
+
+        # Load aligned features for selected-lesion details and image linking.
+        try:
+            features = load_patient_features(feature_path, patient_id)
+        except (FileNotFoundError, MatchingDashboardError) as exc:
+            st.warning(
+                f"Matching results are available, but feature details are unavailable: {exc}"
             )
-            with st.expander("Cost component details"):
-                st.dataframe(detail_table, hide_index=True, width="stretch")
+            features = pd.DataFrame()
 
-        st.caption(f"Matcher feature/cost source: {pair_cost_path}")
-    else:
-        # NEW/DISAPPEARING rows have no BL↔FU candidate edge. Show the available
-        # single-lesion features instead and make distance explicitly N/A.
-        feature_metrics = st.columns(4)
-        feature_metrics[0].metric("Distance", "N/A")
-        feature_metrics[1].metric(
-            "BL volume",
-            _format_metric_number(
-                None if bl_feature is None else bl_feature.get("volume_ml"),
-                digits=3,
-                suffix=" mL",
-            ),
-        )
-        feature_metrics[2].metric(
-            "FU volume",
-            _format_metric_number(
-                None if fu_feature is None else fu_feature.get("volume_ml"),
-                digits=3,
-                suffix=" mL",
-            ),
-        )
-        feature_metrics[3].metric("Size difference", "N/A")
+        bl_feature = _feature_row(features, timepoint="BL", lesion_id=bl_id)
+        fu_feature = _feature_row(features, timepoint="FU", lesion_id=fu_id)
 
-        if bl_id is not None and fu_id is not None:
-            st.info(
-                "No matching row was found in the pair-cost detail CSV for this BL/FU pair. "
-                "Check that the pair-cost CSV belongs to the same pipeline run as the match results."
+        # Pair-cost CSV contains the actual feature breakdown used to construct candidate edges.
+        try:
+            pair_costs = _patient_auxiliary_rows(pair_cost_path, patient_id)
+        except Exception as exc:
+            st.warning(f"Could not read pair-cost details: {exc}")
+            pair_costs = None
+
+        pair_cost_row = _event_row(
+            pair_costs,
+            bl_lesion_id=bl_id,
+            fu_lesion_id=fu_id,
+        )
+
+        overview = st.columns(4)
+        overview[0].metric("BL lesion ID", bl_id or "—")
+        overview[1].metric("FU lesion ID", fu_id or "—")
+        overview[2].metric("Outcome", match_type or "—")
+        overview[3].metric(
+            "Match cost",
+            _format_metric_number(selected_match.get("match_cost"), digits=4),
+        )
+
+        if match_type == "DISAPPEARING":
+            st.warning(
+                f"{bl_id or 'BL lesion'} has no FU correspondence and is labelled DISAPPEARING."
             )
-        else:
+        elif match_type == "NEW":
+            st.warning(
+                f"{fu_id or 'FU lesion'} has no BL correspondence and is labelled NEW."
+            )
+
+        focus = None
+        if not features.empty:
+            try:
+                focus = resolve_match_image_focus(selected_match, features)
+            except MatchingDashboardError as exc:
+                st.warning(
+                    f"Match details are available, but image linking is unavailable: {exc}"
+                )
+
+        if focus is not None and focus_renderer is not None:
+            focus_renderer(focus)
+        elif focus is not None:
             st.caption(
-                "Distance and pairwise size difference are not applicable to NEW/DISAPPEARING "
-                "events because one endpoint is absent. The displayed match cost is the unmatched "
-                "event penalty used by the flow model."
+                "Selected lesion spatial locations are available for aligned-image visualisation."
             )
+
+        st.markdown("##### Matcher features and cost")
+        if pair_cost_row is not None:
+            feature_metrics = st.columns(4)
+            feature_metrics[0].metric(
+                "Distance",
+                _format_metric_number(
+                    pair_cost_row.get("distance_mm"), digits=2, suffix=" mm"
+                ),
+            )
+            feature_metrics[1].metric(
+                "BL volume",
+                _format_metric_number(
+                    pair_cost_row.get("bl_volume_ml"), digits=3, suffix=" mL"
+                ),
+            )
+            feature_metrics[2].metric(
+                "FU volume",
+                _format_metric_number(
+                    pair_cost_row.get("fu_volume_ml"), digits=3, suffix=" mL"
+                ),
+            )
+            size_fraction = _safe_float(
+                pair_cost_row.get("size_difference_fraction")
+            )
+            feature_metrics[3].metric(
+                "Size difference",
+                "—" if size_fraction is None else f"{100.0 * size_fraction:.1f}%",
+            )
+
+            cost_fields = [
+                "distance_cost",
+                "size_cost",
+                "pet_cost",
+                "total_cost",
+                "candidate_rank_for_bl",
+                "pet_feature",
+                "bl_pet_value",
+                "fu_pet_value",
+                "pet_difference_fraction",
+                "pet_used",
+            ]
+            available_cost_fields = [
+                field for field in cost_fields if field in pair_cost_row.index
+            ]
+            if available_cost_fields:
+                detail_table = pd.DataFrame(
+                    {
+                        "Field": available_cost_fields,
+                        "Value": [
+                            _arrow_safe_display_value(pair_cost_row.get(field))
+                            for field in available_cost_fields
+                        ],
+                    }
+                )
+                with st.expander("Cost component details"):
+                    st.dataframe(detail_table, hide_index=True, width="stretch")
+
+            st.caption(f"Matcher feature/cost source: {pair_cost_path}")
+        else:
+            # NEW/DISAPPEARING rows have no BL↔FU candidate edge. Show the available
+            # single-lesion features instead and make distance explicitly N/A.
+            feature_metrics = st.columns(4)
+            feature_metrics[0].metric("Distance", "N/A")
+            feature_metrics[1].metric(
+                "BL volume",
+                _format_metric_number(
+                    None if bl_feature is None else bl_feature.get("volume_ml"),
+                    digits=3,
+                    suffix=" mL",
+                ),
+            )
+            feature_metrics[2].metric(
+                "FU volume",
+                _format_metric_number(
+                    None if fu_feature is None else fu_feature.get("volume_ml"),
+                    digits=3,
+                    suffix=" mL",
+                ),
+            )
+            feature_metrics[3].metric("Size difference", "N/A")
+
+            if bl_id is not None and fu_id is not None:
+                st.info(
+                    "No matching row was found in the pair-cost detail CSV for this BL/FU pair. "
+                    "Check that the pair-cost CSV belongs to the same pipeline run as the match results."
+                )
+            else:
+                st.caption(
+                    "Distance and pairwise size difference are not applicable to "
+                    "NEW/DISAPPEARING events because one endpoint is absent. The displayed "
+                    "match cost is the unmatched event penalty used by the flow model."
+                )
+
+        st.caption(f"Spatial locations loaded from: {feature_path}")
 
     # Ground-truth agreement is read only from evaluation output. The dashboard does
     # not use GT to make or change the prediction.
@@ -1195,17 +1248,8 @@ def _render_matching_panel(
             "displayed GT status as current."
         )
 
-    # Preserve existing image-linking behaviour.
-    if features.empty:
-        return None
-
-    try:
-        focus = resolve_match_image_focus(selected_match, features)
-    except MatchingDashboardError as exc:
-        st.warning(f"Match details are available, but image linking is unavailable: {exc}")
-        return None
-
-    st.caption(f"Spatial locations loaded from: {feature_path}")
+    # The selected correspondence has already been resolved above so it can be
+    # rendered beside its matching evidence in the P31-36 review container.
     return focus
 
 
@@ -1247,8 +1291,7 @@ def _render_lesion_focus(
     followup_mask=None,
 ) -> None:
     #show each selected mask on a slice that contains the lesion
-    st.divider()
-    st.subheader("Selected correspondence on aligned scans")
+    st.markdown("##### Selected correspondence on aligned scans")
     status, colour = OUTCOME_STYLES.get(focus.match_type, (focus.match_type, (0, 220, 255)))
     st.markdown(f"**{status}**")
     st.caption("Cyan: automatic match · Amber: appearing · Pink: disappearing. "
@@ -2271,26 +2314,20 @@ def main() -> None:
         fu_mask=fu_mask,
     )
 
-    # Matching is intentionally rendered after the complete alignment viewer.
+    # P31-36: anchor the selected correspondence review immediately below the
+    # alignment images.  The detailed patient-level tables/evaluation remain below
+    # this compact review card, so users no longer need to scroll to the bottom to
+    # compare a chosen lesion pair with the aligned scans.
     st.divider()
-    st.header("Lesion Matching")
-
-    match_image_focus = _render_matching_panel(
-        patient_id=patient_id,
-        manifest_path=manifest_path,
-        data_root=data_root,
-        paths=paths,
-        run_matching=run_matching,
-        run_evaluation=run_evaluation,
-        config=MatcherConfig(
-            disappearing_penalty=float(disappearing_penalty),
-            new_lesion_penalty=float(new_lesion_penalty),
-            merge_penalty=float(merge_penalty),
-            max_bl_per_fu=int(max_bl_per_fu),
-        ),
+    st.header("Lesion Matching Review")
+    st.caption(
+        "Select a lesion event below to review its aligned BL/FU locations and "
+        "the matcher evidence in one place."
     )
+    matching_visualisation = st.container(border=True)
 
-    if match_image_focus is not None:
+    def _render_selected_correspondence(focus: MatchImageFocus) -> None:
+        nonlocal registered_bl_mask
         # The selected correspondence image needs the registered BL mask even if
         # the alignment-view mask checkbox is OFF, so prepare it lazily here.
         if registered_bl_mask is None and bl_mask is not None:
@@ -2320,7 +2357,7 @@ def main() -> None:
                 )
 
         _render_lesion_focus(
-            match_image_focus,
+            focus,
             registered_display=_prepare_display_volume(
                 registered_bl.data, low_hu=-160, high_hu=240
             ),
@@ -2333,6 +2370,23 @@ def main() -> None:
             baseline_mask=registered_bl_mask,
             followup_mask=fu_mask,
         )
+
+    match_image_focus = _render_matching_panel(
+        patient_id=patient_id,
+        manifest_path=manifest_path,
+        data_root=data_root,
+        paths=paths,
+        run_matching=run_matching,
+        run_evaluation=run_evaluation,
+        config=MatcherConfig(
+            disappearing_penalty=float(disappearing_penalty),
+            new_lesion_penalty=float(new_lesion_penalty),
+            merge_penalty=float(merge_penalty),
+            max_bl_per_fu=int(max_bl_per_fu),
+        ),
+        visualisation_container=matching_visualisation,
+        focus_renderer=_render_selected_correspondence,
+    )
     with st.expander("Registration / viewer details"):
         st.write("BL CT source:", str(bl_ct.metadata.path))
         st.write("FU CT source:", str(fu_ct.metadata.path))

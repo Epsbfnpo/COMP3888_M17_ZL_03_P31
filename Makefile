@@ -20,6 +20,7 @@ TEST_FILES := $(sort $(wildcard \
 	$(TEST_DIR)/test_p31_32*.py \
 	$(TEST_DIR)/test_p31_33*.py \
 	$(TEST_DIR)/test_p31_34*.py \
+	$(TEST_DIR)/test_p31_36*.py \
 ))
 
 PAIRS := $(OUT_DIR)/cohort_a_subset_pairs.csv
@@ -34,7 +35,7 @@ MANIFEST_ARGS := --patient-ids "$(PATIENT_IDS)"
 endif
 
 .PHONY: setup manifest dashboard run test test-coverage coverage show-tests \
-	test-p31-26 test-p31-27 test-p31-29 test-p31-31 test-p31-32 test-p31-33 test-p31-34 test-assigned
+	test-p31-26 test-p31-27 test-p31-29 test-p31-31 test-p31-32 test-p31-33 test-p31-34 test-p31-36 test-assigned
 .DEFAULT_GOAL := run
 
 setup:
@@ -53,11 +54,11 @@ show-tests:
 	@printf '%s\n' $(TEST_FILES)
 
 test:
-	@if [ -z "$(strip $(TEST_FILES))" ]; then echo "ERROR: no P31-26 to P31-34 test files found under $(TEST_DIR)"; exit 1; fi
+	@if [ -z "$(strip $(TEST_FILES))" ]; then echo "ERROR: no configured P31 test files found under $(TEST_DIR)"; exit 1; fi
 	"$(PYTHON)" -m pytest -q $(TEST_FILES)
 
 test-coverage:
-	@if [ -z "$(strip $(TEST_FILES))" ]; then echo "ERROR: no P31-26 to P31-34 test files found under $(TEST_DIR)"; exit 1; fi
+	@if [ -z "$(strip $(TEST_FILES))" ]; then echo "ERROR: no configured P31 test files found under $(TEST_DIR)"; exit 1; fi
 	"$(PYTHON)" -m pytest -q $(TEST_FILES) --cov=src --cov-branch --cov-report=term-missing --cov-report=html:$(COVERAGE_DIR) --cov-report=xml:coverage.xml
 	@echo "Coverage report: $(COVERAGE_DIR)/index.html"
 
@@ -90,3 +91,6 @@ test-p31-33:
 
 test-p31-34:
 	"$(PYTHON)" -m pytest -q $(TEST_DIR)/test_p31_34_robustness.py
+
+test-p31-36:
+	"$(PYTHON)" -m pytest -q $(TEST_DIR)/test_p31_36_matching_layout.py
