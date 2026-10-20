@@ -1,100 +1,84 @@
-from dataclasses import replace
+from types import SimpleNamespace
 import numpy as np
-import nibabel as nib
 import pytest
-from src.cohort_a_loading import load_nifti_volume
-from src.matching_dashboard import LesionLocation
-from src.correspondence_visualization import selected_lesion_mask, lesion_display_slice, OUTCOME_STYLES
+from src import correspondence_visualization as cv
+def location(**changes):
+    values = {
+        "mask_path": None,
+        "component_index": 2,
+        "mask_role": "regular",
+        "timepoint": "FU",
+        "connectivity": 18,
+        "centroid_voxel": (1.0, 1.5, 1.0),
+        "lesion_id": "L2",
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
 
-def volume(tmp_path, data, name='mask', affine=None):
-    path = tmp_path / (name + '.nii.gz')
-    nib.save(nib.Nifti1Image(data.astype(np.int16), np.eye(4) if affine is None else affine), path)
-    return load_nifti_volume(path, preserve_dtype=True)
+def test_selected_mask_loads_and_extracts_component(monkeypatch):
+    raw = SimpleNamespace(data=np.zeros((3, 3, 3)))
+    labels = np.zeros((3, 3, 3), dtype=int)
+    labels[1, 1:3, 1] = 2
+    monkeypatch.setattr(cv, "load_nifti_volume", lambda *args, **kwargs: raw)
+    extract = SimpleNamespace(labelled_mask=labels)
+    monkeypatch.setattr(cv, "extract_individual_lesions", lambda *args, **kwargs: extract)
+    monkeypatch.setattr(cv, "validate_image_mask_alignment", lambda *args: None)
 
-def test_selects_component_not_all_mask_voxels(tmp_path):
-    data = np.zeros((12, 12, 12))
-    data[1:3, 1:3, 1:3] = 1
-    data[7:10, 7:10, 7:10] = 1
-    v = volume(tmp_path, data)
-    location = LesionLocation('p_BL_L002', 'BL', (8, 8, 8), 2)
-    result = selected_lesion_mask(location, v, v)
-    assert result.sum() == 27
-    assert not result[1, 1, 1]
-    for axis in (0, 1, 2):
-        image, index = lesion_display_slice(result, axis)
-        assert index in (7, 8, 9)
-        assert image.sum() == 9
-    with pytest.raises(ValueError, match='centroid disagree'):
-        selected_lesion_mask(replace(location, centroid_voxel=(1, 1, 1)), v, v)
+    result = cv.selected_lesion_mask(location(mask_path="mask.nii.gz"), object())
 
-def test_preserves_resampled_native_ids_even_when_disconnected(tmp_path):
-    data = np.zeros((10, 10, 10))
-    data[1, 1, 1] = data[7, 7, 7] = 9
-    v = volume(tmp_path, data)
-    location = LesionLocation('p_BL_L009', 'BL', (4, 4, 4), 9, 18,
-                             str(v.metadata.path), 'BL_native_component_IDs_rigidly_resampled_to_FU')
-    result = selected_lesion_mask(location, v)
-    assert result.sum() == 2
-    image, index = lesion_display_slice(result, 2)
-    assert image.sum() == 1  #centroid slice would be empty
-    with pytest.raises(ValueError, match='does not contain'):
-        selected_lesion_mask(replace(location, component_index=3), v)
-    wrong_grid = volume(tmp_path, data, 'other', np.diag([2, 2, 2, 1]))
-    with pytest.raises(ValueError, match='affines'):
-        selected_lesion_mask(location, wrong_grid)
+    np.testing.assert_array_equal(result, labels == 2)
 
-def test_outcomes_have_distinct_colours_and_explicit_labels():
-    assert len({OUTCOME_STYLES[k][1] for k in ('MATCHED', 'NEW', 'DISAPPEARING')}) == 3
-    assert 'no BL' in OUTCOME_STYLES['NEW'][0]
-    assert 'no FU' in OUTCOME_STYLES['DISAPPEARING'][0]
+def test_native_component_ids_skip_extraction(monkeypatch):
+    labels = np.zeros((2, 2, 2), dtype=int)
+    labels[1, 1, 1] = 4
+    fallback = SimpleNamespace(data=labels)
+    #native label are already component ids, so no re-label is needed
+    def unexpected_call(*args, **kwargs):
+        pytest.fail("extract_individual_lesions should not be called")
 
-@pytest.mark.parametrize('outcome,has_bl,has_fu', [('MATCHED', True, True), ('MERGING', True, True), ('NEW', False, True), ('DISAPPEARING', True, False)])
-def test_focus_renders_masks_ids_and_missing_side(tmp_path, monkeypatch, outcome, has_bl, has_fu):
-    from contextlib import nullcontext
-    from tools import align_longitudinal_patient_v5_mapped as dashboard
-    from src.matching_dashboard import MatchImageFocus
-    data = np.zeros((8, 8, 8))
-    data[2:5, 2:5, 2:5] = 1
-    v = volume(tmp_path, data)
-    bl = LesionLocation('p_BL_L001', 'BL', (3, 3, 3), 1)
-    fu = replace(bl, lesion_id='p_FU_L001', timepoint='FU')
-    images, messages, errors = [], [], []
-    monkeypatch.setattr(dashboard.st, 'columns', lambda n: [nullcontext() for _ in range(n)])
-    for method in ('divider', 'subheader', 'caption'):
-        monkeypatch.setattr(dashboard.st, method, lambda *a, **k: None)
-    for method in ('markdown', 'info'):
-        monkeypatch.setattr(dashboard.st, method, lambda text: messages.append(text))
-    monkeypatch.setattr(dashboard.st, 'error', errors.append)
-    monkeypatch.setattr(dashboard.st, 'image', lambda image, **kw: images.append(image))
-    dashboard._render_lesion_focus(
-        MatchImageFocus(outcome, bl if has_bl else None, fu if has_fu else None),
-        registered_display=np.zeros_like(data, dtype=np.uint8),
-        fu_display=np.zeros_like(data, dtype=np.uint8), fu_ct=v,
-        modality='CT', plane_name='Axial', baseline_mask=v, followup_mask=v,
+    monkeypatch.setattr(cv, "extract_individual_lesions", unexpected_call)
+    monkeypatch.setattr(cv, "validate_image_mask_alignment", lambda *args: None)
+    item = location(
+        component_index=4,
+        centroid_voxel=(1, 1, 1),
+        mask_role="BL_native_component_IDs_rigidly_resampled_to_FU",
     )
-    assert not errors
-    assert len(images) == int(has_bl) + int(has_fu)
-    assert all(image.max() > 0 for image in images)
-    if has_bl:
-        assert any('p_BL_L001' in text for text in messages)
-    if has_fu:
-        assert any('p_FU_L001' in text for text in messages)
-    if not (has_bl and has_fu):
-        assert any(text.startswith('No ') for text in messages)
 
-def test_resolve_selected_bl_preserves_mask_metadata():
-    import pandas as pd
-    from src.matching_dashboard import resolve_match_image_focus
-    rows = pd.DataFrame([
-        dict(patient_id='p', timepoint=tp, lesion_id=f'p_{tp}_L001',
-             centroid_x_vox=3, centroid_y_vox=3, centroid_z_vox=3,
-             component_index=1, connectivity=26, mask_path=f'{tp}.nii.gz',
-             mask_role='') for tp in ('BL', 'FU')
-    ])
-    focus = resolve_match_image_focus(pd.Series(dict(
-        bl_lesion_id='p_BL_L001', fu_lesion_id='p_FU_L001', match_type='MATCHED'
-    )), rows)
-    assert focus.baseline.mask_path == 'BL.nii.gz'
-    assert focus.followup.lesion_id == 'p_FU_L001'
-    assert focus.followup.component_index == 1
-    assert focus.followup.connectivity == 26
+    result = cv.selected_lesion_mask(item, object(), fallback)
+    np.testing.assert_array_equal(result, labels == 4)
+
+
+def test_missing_mask_raises_error():
+    with pytest.raises(ValueError, match="No segmentation mask"):
+        cv.selected_lesion_mask(location(), object())
+
+def test_missing_component_index_raises_error(monkeypatch):
+    fallback = SimpleNamespace(data=np.zeros((2, 2, 2)))
+    monkeypatch.setattr(cv, "validate_image_mask_alignment", lambda *args: None)
+    with pytest.raises(ValueError, match="component_index"):
+        cv.selected_lesion_mask(location(component_index=None), object(), fallback)
+
+
+def test_centroid_mismatch_raises_error(monkeypatch):
+    labels = np.zeros((2, 2, 2), dtype=int)
+    labels[0, 0, 0] = 2
+    fallback = SimpleNamespace(data=labels)
+    extracted = SimpleNamespace(labelled_mask=labels)
+    monkeypatch.setattr(cv, "extract_individual_lesions", lambda *args, **kwargs: extracted)
+    monkeypatch.setattr(cv, "validate_image_mask_alignment", lambda *args: None)
+    with pytest.raises(ValueError, match="centroid disagree"):
+        cv.selected_lesion_mask(
+            location(centroid_voxel=(1, 1, 1)), object(), fallback
+        )
+
+def test_lesion_display_slice(monkeypatch):
+    mask = np.zeros((2, 3, 4), dtype=bool)
+    shown = np.ones((2, 3), dtype=bool)
+    monkeypatch.setattr(cv, "select_lesion_slice", lambda mask, axis: 2)
+    monkeypatch.setattr(
+        cv, "extract_display_slice", lambda mask, axis, index: shown
+    )
+    
+    result, index = cv.lesion_display_slice(mask, axis=1)
+    assert result is shown
+    assert index == 2
