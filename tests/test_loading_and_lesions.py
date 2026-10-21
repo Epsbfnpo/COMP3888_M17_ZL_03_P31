@@ -71,6 +71,34 @@ def make_manifest(tmp_path: Path) -> tuple[Path, Path, list[str]]:
     return root, manifest, patient_ids
 
 
+def update_manifest_value(
+    manifest: Path,
+    *,
+    patient_id: str,
+    column: str,
+    value: str,
+) -> None:
+    """Update one manifest cell without assuming a platform-specific path separator."""
+    with manifest.open("r", newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise AssertionError("Synthetic manifest unexpectedly has no rows.")
+    if column not in rows[0]:
+        raise AssertionError(f"Synthetic manifest is missing column: {column}")
+
+    matches = [row for row in rows if row.get("patient_id") == patient_id]
+    if len(matches) != 1:
+        raise AssertionError(
+            f"Expected exactly one synthetic row for {patient_id!r}, found {len(matches)}."
+        )
+    matches[0][column] = value
+
+    with manifest.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def test_loads_bl_fu_pet_ct_and_metadata_for_multiple_patients(tmp_path: Path) -> None:
     root, manifest, patient_ids = make_manifest(tmp_path)
     for patient_id in patient_ids:
@@ -140,8 +168,12 @@ def test_empty_and_invalid_masks_are_detected(tmp_path: Path) -> None:
 
 def test_missing_and_unreadable_files_produce_clear_errors(tmp_path: Path) -> None:
     root, manifest, _ = make_manifest(tmp_path)
-    text = manifest.read_text(encoding="utf-8")
-    manifest.write_text(text.replace("inputsTr/patient_alpha_BL_pet_00.nii.gz", ""), encoding="utf-8")
+    update_manifest_value(
+        manifest,
+        patient_id="patient_alpha",
+        column="bl_pet_path",
+        value="",
+    )
     with pytest.raises(MissingImagingFileError, match="bl_pet_path"):
         load_patient_pair(manifest, "patient_alpha", data_root=root, modalities=("pet",))
 
@@ -160,12 +192,12 @@ def test_resolves_outputsTr_mask_and_cohort_a_root_env(tmp_path: Path, monkeypat
     target.parent.mkdir(parents=True, exist_ok=True)
     source.replace(target)
 
-    text = manifest.read_text(encoding="utf-8")
-    text = text.replace(
-        "inputsTr/patient_alpha_BL_mask_00.nii.gz",
-        "outputsTr/patient_alpha_BL_mask_00.nii.gz",
+    update_manifest_value(
+        manifest,
+        patient_id="patient_alpha",
+        column="bl_lesion_mask_path",
+        value=str(Path("outputsTr") / "patient_alpha_BL_mask_00.nii.gz"),
     )
-    manifest.write_text(text, encoding="utf-8")
 
     monkeypatch.setenv("COHORT_A_ROOT", str(root))
     pair = load_patient_pair(manifest, "patient_alpha", modalities=("lesion_mask",))
