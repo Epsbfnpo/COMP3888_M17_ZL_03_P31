@@ -47,7 +47,7 @@ H_COVERAGE_ARGS := \
 	--cov=src.lesion_pair_costs \
 	--cov=src.multiplanar_view \
 	--cov=src.tracking_summary
-
+	
 PAIRS := $(OUT_DIR)/cohort_a_subset_pairs.csv
 
 export DATA_ROOT := $(DATA)

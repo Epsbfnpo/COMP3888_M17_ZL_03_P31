@@ -34,3 +34,17 @@ Thumbs.db
 /*.html
 /docs/**/.Rhistory
 /docs/**/*.html
+
+# Test results and coverage reports
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+coverage.json
+junit.xml
+.pytest_cache/
+
+# Additional generated test files
+test-results/
+test_results/
+pytest-report.xml
