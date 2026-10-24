@@ -10,44 +10,11 @@ PORT ?= 8501
 TEST_DIR ?= tests
 COVERAGE_DIR ?= htmlcov
 
-TEST_FILES := $(sort $(wildcard \
-	$(TEST_DIR)/test_p31_26*.py \
-	$(TEST_DIR)/test_p31_27*.py \
-	$(TEST_DIR)/test_p31_28*.py \
-	$(TEST_DIR)/test_p31_29*.py \
-	$(TEST_DIR)/test_p31_30*.py \
-	$(TEST_DIR)/test_p31_31*.py \
-	$(TEST_DIR)/test_p31_32*.py \
-	$(TEST_DIR)/test_p31_33*.py \
-	$(TEST_DIR)/test_p31_34*.py \
-	$(TEST_DIR)/test_p31_36*.py \
-))
+# P31 tests are functional tests; other test_*.py files are unit tests.
+FUNCTIONAL_TEST_FILES := $(sort $(wildcard $(TEST_DIR)/test_p31_*.py))
+UNIT_TEST_FILES := $(filter-out $(FUNCTIONAL_TEST_FILES),$(sort $(wildcard $(TEST_DIR)/test_*.py)))
+ALL_TEST_FILES := $(sort $(FUNCTIONAL_TEST_FILES) $(UNIT_TEST_FILES))
 
-
-H_FUNCTIONAL_TEST_FILES := \
-	$(TEST_DIR)/test_p31_26_patient_data_loading_functional.py \
-	$(TEST_DIR)/test_p31_27_lesion_features_functional.py \
-	$(TEST_DIR)/test_p31_29_pair_cost_functional.py \
-	$(TEST_DIR)/test_p31_31_visualization_summary_functional.py \
-	$(TEST_DIR)/test_p31_36_matching_layout.py
-
-H_UNIT_TEST_FILES := \
-	$(TEST_DIR)/test_loading_and_lesions.py \
-	$(TEST_DIR)/test_lesion_components.py \
-	$(TEST_DIR)/test_lesion_features.py \
-	$(TEST_DIR)/test_lesion_pair_costs.py \
-	$(TEST_DIR)/test_multiplanar_view.py \
-	$(TEST_DIR)/test_tracking_summary.py \
-	$(TEST_DIR)/test_h_coverage_edge_cases.py
-
-H_COVERAGE_ARGS := \
-	--cov=src.cohort_a_loading \
-	--cov=src.lesion_components \
-	--cov=src.lesion_features \
-	--cov=src.lesion_pair_costs \
-	--cov=src.multiplanar_view \
-	--cov=src.tracking_summary
-	
 PAIRS := $(OUT_DIR)/cohort_a_subset_pairs.csv
 
 export DATA_ROOT := $(DATA)
@@ -59,8 +26,7 @@ ifneq ($(strip $(PATIENT_IDS)),)
 MANIFEST_ARGS := --patient-ids "$(PATIENT_IDS)"
 endif
 
-.PHONY: setup manifest dashboard run test test-coverage coverage show-tests \
-	test-p31-26 test-p31-27 test-p31-29 test-p31-31 test-p31-32 test-p31-33 test-p31-34 test-p31-36 test-assigned test-h test-h-unit test-h-coverage
+.PHONY: setup manifest dashboard run test test-functional test-unit test-coverage test-functional-coverage test-unit-coverage
 .DEFAULT_GOAL := run
 
 setup:
@@ -75,57 +41,31 @@ dashboard:
 run: manifest
 	"$(PYTHON)" -m streamlit run "$(DASHBOARD)" --server.port "$(PORT)"
 
-show-tests:
-	@printf '%s\n' $(TEST_FILES)
-
 test:
-	@if [ -z "$(strip $(TEST_FILES))" ]; then echo "ERROR: no configured P31 test files found under $(TEST_DIR)"; exit 1; fi
-	"$(PYTHON)" -m pytest -q $(TEST_FILES)
+	@if [ -z "$(strip $(ALL_TEST_FILES))" ]; then echo "ERROR: no test files found under $(TEST_DIR)"; exit 1; fi
+	"$(PYTHON)" -m pytest -q $(ALL_TEST_FILES)
+
+test-functional:
+	@if [ -z "$(strip $(FUNCTIONAL_TEST_FILES))" ]; then echo "ERROR: no P31 functional tests found under $(TEST_DIR)"; exit 1; fi
+	"$(PYTHON)" -m pytest -q $(FUNCTIONAL_TEST_FILES)
+
+test-unit:
+	@if [ -z "$(strip $(UNIT_TEST_FILES))" ]; then echo "ERROR: no unit tests found under $(TEST_DIR)"; exit 1; fi
+	"$(PYTHON)" -m pytest -q $(UNIT_TEST_FILES)
+
+# Statement coverage and branch coverage are both included by --cov-branch.
+# Keep separate reports and raw coverage data for each test group.
+test-functional-coverage:
+	@if [ -z "$(strip $(FUNCTIONAL_TEST_FILES))" ]; then echo "ERROR: no P31 functional tests found under $(TEST_DIR)"; exit 1; fi
+	COVERAGE_FILE=.coverage.functional "$(PYTHON)" -m pytest -q $(FUNCTIONAL_TEST_FILES) --cov=src --cov-branch --cov-report=term-missing --cov-report=html:$(COVERAGE_DIR)/functional --cov-report=xml:coverage-functional.xml --cov-report=json:coverage-functional.json
+	@echo "Functional coverage: $(COVERAGE_DIR)/functional/index.html | coverage-functional.xml | coverage-functional.json"
+
+test-unit-coverage:
+	@if [ -z "$(strip $(UNIT_TEST_FILES))" ]; then echo "ERROR: no unit tests found under $(TEST_DIR)"; exit 1; fi
+	COVERAGE_FILE=.coverage.unit "$(PYTHON)" -m pytest -q $(UNIT_TEST_FILES) --cov=src --cov-branch --cov-report=term-missing --cov-report=html:$(COVERAGE_DIR)/unit --cov-report=xml:coverage-unit.xml --cov-report=json:coverage-unit.json
+	@echo "Unit coverage: $(COVERAGE_DIR)/unit/index.html | coverage-unit.xml | coverage-unit.json"
 
 test-coverage:
-	@if [ -z "$(strip $(TEST_FILES))" ]; then echo "ERROR: no configured P31 test files found under $(TEST_DIR)"; exit 1; fi
-	"$(PYTHON)" -m pytest -q $(TEST_FILES) --cov=src --cov-branch --cov-report=term-missing --cov-report=html:$(COVERAGE_DIR) --cov-report=xml:coverage.xml
-	@echo "Coverage report: $(COVERAGE_DIR)/index.html"
-
-coverage: test-coverage
-
-test-p31-26: manifest
-	P31_RUN_REAL_LOADING_TESTS=1 "$(PYTHON)" -m pytest -q $(TEST_DIR)/test_p31_26_patient_data_loading_functional.py
-
-test-p31-27:
-	"$(PYTHON)" -m pytest -q $(TEST_DIR)/test_p31_27_lesion_features_functional.py
-
-test-p31-29:
-	"$(PYTHON)" -m pytest -q $(TEST_DIR)/test_p31_29_pair_cost_functional.py
-
-test-p31-31:
-	"$(PYTHON)" -m pytest -q $(TEST_DIR)/test_p31_31_visualization_summary_functional.py
-
-test-assigned:
-	"$(PYTHON)" -m pytest -q \
-		$(TEST_DIR)/test_p31_26_patient_data_loading_functional.py \
-		$(TEST_DIR)/test_p31_27_lesion_features_functional.py \
-		$(TEST_DIR)/test_p31_29_pair_cost_functional.py \
-		$(TEST_DIR)/test_p31_31_visualization_summary_functional.py
-
-test-p31-32:
-	"$(PYTHON)" -m pytest -q -rA $(TEST_DIR)/test_p31_32_dashboard_responsiveness.py
-
-test-p31-33:
-	"$(PYTHON)" -m pytest -q -rA $(TEST_DIR)/test_p31_33_pipeline_stability.py
-
-test-p31-34:
-	"$(PYTHON)" -m pytest -q $(TEST_DIR)/test_p31_34_robustness.py
-
-test-p31-36:
-	"$(PYTHON)" -m pytest -q $(TEST_DIR)/test_p31_36_matching_layout.py
-
-test-h:
-	"$(PYTHON)" -m pytest -q $(H_FUNCTIONAL_TEST_FILES) $(H_UNIT_TEST_FILES)
-
-test-h-unit:
-	"$(PYTHON)" -m pytest -q $(H_UNIT_TEST_FILES)
-
-test-h-coverage:
-	"$(PYTHON)" -m pytest -q $(H_UNIT_TEST_FILES) $(H_COVERAGE_ARGS) --cov-branch --cov-report=term-missing --cov-fail-under=100
-
+	@if [ -z "$(strip $(ALL_TEST_FILES))" ]; then echo "ERROR: no test files found under $(TEST_DIR)"; exit 1; fi
+	COVERAGE_FILE=.coverage.all "$(PYTHON)" -m pytest -q $(ALL_TEST_FILES) --cov=src --cov-branch --cov-report=term-missing --cov-report=html:$(COVERAGE_DIR) --cov-report=xml:coverage.xml --cov-report=json:coverage.json
+	@echo "All-tests coverage: $(COVERAGE_DIR)/index.html | coverage.xml | coverage.json"
