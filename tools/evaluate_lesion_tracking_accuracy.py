@@ -68,7 +68,7 @@ def _read_csv(path: str | Path, description: str) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"{description} CSV does not exist: {path}")
     try:
-        return pd.read_csv(path)
+        return pd.read_csv(path, dtype={"patient_id": str})
     except Exception as exc:
         raise TrackingEvaluationError(
             f"Could not read {description} CSV '{path}': {exc}"

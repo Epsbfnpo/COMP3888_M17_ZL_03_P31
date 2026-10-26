@@ -76,7 +76,7 @@ def _read_csv(path: str | Path, description: str) -> pd.DataFrame:
     if not csv_path.exists():
         raise FileNotFoundError(f"{description} CSV does not exist: {csv_path}")
     try:
-        return pd.read_csv(csv_path)
+        return pd.read_csv(csv_path, dtype={"patient_id": str})
     except Exception as exc:
         raise BatchEvaluationError(
             f"Could not read {description} CSV '{csv_path}': {exc}"
