@@ -880,10 +880,9 @@ def _render_matching_panel(
                         else f"{100.0 * float(value):.1f}%"
                     )
                 )
-            # Rename the column for display only; source evaluation keys stay unchanged.
-            display_summary = display_summary.rename(
-                columns={"tracking_accuracy": "recall"}
-            )
+            # Select the intended columns before renaming: the evaluation summary
+            # also includes a separate recall column, so renaming the full frame
+            # would produce duplicate column names for Streamlit/PyArrow.
             cohort_columns = [
                 "patient_id",
                 "bl_lesions",
@@ -893,11 +892,13 @@ def _render_matching_panel(
                 "disappearing_lesions",
                 "correct_matches",
                 "incorrect_matches",
-                "recall",
+                "tracking_accuracy",
                 "evaluation_status",
             ]
             st.dataframe(
-                display_summary[cohort_columns],
+                display_summary[cohort_columns].rename(
+                    columns={"tracking_accuracy": "recall"}
+                ),
                 hide_index=True,
                 width="stretch",
             )
