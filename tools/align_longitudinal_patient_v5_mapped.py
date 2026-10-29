@@ -757,7 +757,7 @@ def _render_matching_panel(
         return None
 
     # P31-22 patient-level summary. Structural counts always come from the
-    # matcher output; ground-truth accuracy is attached only when the P31-18
+    # matcher output; ground-truth recall is attached only when the P31-18
     # evaluation summary is available.
     evaluation_summary = None
     evaluation_summary_warning = None
@@ -809,13 +809,13 @@ def _render_matching_panel(
                 "Incorrect matches", int(patient_summary["incorrect_matches"])
             )
             summary_row_2[4].metric(
-                "Tracking accuracy",
+                "Tracking recall",
                 f"{100.0 * float(patient_summary['tracking_accuracy']):.1f}%",
             )
         else:
             summary_row_2[2].metric("Correct matches", "N/A")
             summary_row_2[3].metric("Incorrect matches", "N/A")
-            summary_row_2[4].metric("Tracking accuracy", "N/A")
+            summary_row_2[4].metric("Tracking recall", "N/A")
 
         st.caption(
             "Matched lesions = unique BL lesions assigned to a FU lesion, including "
@@ -880,6 +880,10 @@ def _render_matching_panel(
                         else f"{100.0 * float(value):.1f}%"
                     )
                 )
+            # Rename the column for display only; source evaluation keys stay unchanged.
+            display_summary = display_summary.rename(
+                columns={"tracking_accuracy": "recall"}
+            )
             cohort_columns = [
                 "patient_id",
                 "bl_lesions",
@@ -889,7 +893,7 @@ def _render_matching_panel(
                 "disappearing_lesions",
                 "correct_matches",
                 "incorrect_matches",
-                "tracking_accuracy",
+                "recall",
                 "evaluation_status",
             ]
             st.dataframe(
@@ -910,14 +914,14 @@ def _render_matching_panel(
                 )
                 if bool(row["ground_truth_available"]):
                     overall_cols[3].metric(
-                        "Overall tracking accuracy",
+                        "Overall tracking recall",
                         f"{100.0 * float(row['tracking_accuracy']):.1f}%",
                     )
                 else:
-                    overall_cols[3].metric("Overall tracking accuracy", "N/A")
+                    overall_cols[3].metric("Overall tracking recall", "N/A")
             st.caption(
                 "The ALL row sums structural lesion counts across patients. "
-                "When P31-18 ground truth is available, overall accuracy uses the "
+                "When P31-18 ground truth is available, overall recall uses the "
                 "evaluation pipeline's combined ALL result rather than averaging "
                 "patient percentages."
             )
@@ -2021,7 +2025,7 @@ def main() -> None:
             width="stretch",
             help=(
                 "Ensures matching is current, then computes correct, incorrect, "
-                "missed, and tracking-accuracy results."
+                "missed, and recall results."
             ),
         )
 
