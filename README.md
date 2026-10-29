@@ -1,8 +1,8 @@
 # Longitudinal Review Station
 
-## Download partial Data
+## Dataset Download 
 
-https://drive.google.com/file/d/1Bl4eEvyTTfXELFZPtFae5xwz1WBtfu_u/view?usp=drive_link
+Partial Data we prepared: https://drive.google.com/file/d/1Bl4eEvyTTfXELFZPtFae5xwz1WBtfu_u/view?usp=drive_link
 
 ### Full dataset
 
