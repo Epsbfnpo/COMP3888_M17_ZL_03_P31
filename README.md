@@ -2,7 +2,7 @@
 
 ## Dataset Download 
 
-### Partial Data (Cohort A) we prepared
+### Partial Data (Cohort A) we prepared ~1.4 GB
 
 https://drive.google.com/file/d/1Bl4eEvyTTfXELFZPtFae5xwz1WBtfu_u/view?usp=drive_link
 
