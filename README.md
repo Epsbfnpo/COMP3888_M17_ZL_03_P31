@@ -1,8 +1,19 @@
 # Longitudinal Review Station
 
-## Data
+## Download partial Data
 
 https://drive.google.com/file/d/1Bl4eEvyTTfXELFZPtFae5xwz1WBtfu_u/view?usp=drive_link
+
+### Full dataset
+
+Cohort A — autoPET-IV Task 2 "Longitudinal-CT": https://fdat.uni-tuebingen.de/records/75kj1-64747
+
+(Data paper: 10.1038/s41597-026-07466-y (DOI), licence CC-BY-4.0, ~51 GB). https://autopet-iv.grand-challenge.org/
+
+Cohort B — autoPET III "PSMA-FDG-PET-CT-Lesions" v3:
+https://fdat.uni-tuebingen.de/records/rdkqd-wdh87
+
+(Data paper: 10.1038/s41597-022-01718-3 (DOI), licence CC-BY-NC-4.0, ~121 GB). Challenge portal: https://autopet-iii.grand-challenge.org/
 
 ## Quick Start with Makefile
 
